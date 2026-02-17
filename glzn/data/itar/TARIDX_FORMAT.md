@@ -78,21 +78,21 @@ The row region continues to EOF.
 
 The header is exactly one struct with this layout:
 
-| Field | Type | Size | Meaning |
-|---|---:|---:|---|
-| `magic` | `S8` | 8 | Magic bytes (`TARIDX` + NUL padding) |
-| `major` | `<u2` | 2 | Major format version |
-| `minor` | `<u2` | 2 | Minor format version |
-| `rec_size` | `<u2` | 2 | Row record size (currently 32) |
-| `hdr_size` | `<u2` | 2 | Header size (currently 64) |
-| `n_stems` | `<u8` | 8 | Number of unique stems |
-| `n_rows` | `<u8` | 8 | Number of row records |
-| `n_ext` | `<u4` | 4 | Number of extensions |
-| `n_crash` | `<u4` | 4 | Number of crash stems |
-| `off_crash` | `<u8` | 8 | Byte offset of crash block |
-| `off_arr` | `<u8` | 8 | Byte offset of row array |
-| `flags` | `<u1` | 1 | Bit flags |
-| `reserved` | `V7` | 7 | Reserved bytes (MUST be ignored by readers) |
+| Field       | Type  | Size | Meaning                                     |
+|-------------|------:|-----:|---------------------------------------------|
+| `magic`     | `S8`  | 8    | Magic bytes (`TARIDX` + NUL padding)        |
+| `major`     | `<u2` | 2    | Major format version                        |
+| `minor`     | `<u2` | 2    | Minor format version                        |
+| `rec_size`  | `<u2` | 2    | Row record size (currently 32)              |
+| `hdr_size`  | `<u2` | 2    | Header size (currently 64)                  |
+| `n_stems`   | `<u8` | 8    | Number of unique stems                      |
+| `n_rows`    | `<u8` | 8    | Number of row records                       |
+| `n_ext`     | `<u4` | 4    | Number of extensions                        |
+| `n_crash`   | `<u4` | 4    | Number of crash stems                       |
+| `off_crash` | `<u8` | 8    | Byte offset of crash block                  |
+| `off_arr`   | `<u8` | 8    | Byte offset of row array                    |
+| `flags`     | `<u1` | 1    | Bit flags                                   |
+| `reserved`  | `V7`  | 7    | Reserved bytes (MUST be ignored by readers) |
 
 Flag bits:
 
@@ -127,14 +127,14 @@ Notes:
 
 Each row is exactly 32 bytes:
 
-| Field | Type | Size | Meaning |
-|---|---:|---:|---|
-| `fid` | `<u2` | 2 | Tar shard id |
-| `offset` | `<u8` | 8 | Byte offset of tar header block (512-byte tar header) |
-| `size` | `<u8` | 8 | Payload size in bytes |
-| `extid` | `<u2` | 2 | Extension id into extension table |
-| `crashid` | `<u4` | 4 | Collision disambiguator (`0` canonical, `>=1` crash table) |
-| `keyhash` | `<u8` | 8 | `xxhash64(stem)` integer digest |
+| Field     | Type  | Size | Meaning                                                    |
+|-----------|------:|-----:|------------------------------------------------------------|
+| `fid`     | `<u2` | 2    | Tar shard id                                               |
+| `offset`  | `<u8` | 8    | Byte offset of tar header block (512-byte tar header)      |
+| `size`    | `<u8` | 8    | Payload size in bytes                                      |
+| `extid`   | `<u2` | 2    | Extension id into extension table                          |
+| `crashid` | `<u4` | 4    | Collision disambiguator (`0` canonical, `>=1` crash table) |
+| `keyhash` | `<u8` | 8    | `xxhash64(stem)` integer digest                            |
 
 Payload location in tar file:
 
