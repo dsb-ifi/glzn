@@ -81,21 +81,12 @@ class iTarDataset(Dataset):
             extensions = self._val_ext
 
         self.extensions = [stripext(e) for e in extensions]
-        self._real_ext = {e for e in extensions if e not in _valid_pseudo_extensions}
-        self._pseu_ext = {e for e in extensions if e in _valid_pseudo_extensions}
-        self._extmap = {v:k for k,v in self.fold.state.ext2id.items()}
-        self._nrealext = len(self._real_ext)
-        if self._nrealext == 0:
-            raise ValueError('At least one real extension must be provided!')
-
         self.fold.filter_extensions(self.extensions)
+        self._sync_extension_state()
 
         # Init transforms
         self.transforms = []
         self._trafo = _compose(self.transforms)
-
-        # Init decoders
-        self.decoders = _parse_decoders(self.fold)
 
 
         # Check contiguity for shard mixing
@@ -117,9 +108,11 @@ class iTarDataset(Dataset):
         return len(self.fold.state.arr) // self._nrealext
 
     def __getitem__(self, idx:int) -> tuple:
-        if idx >= len(self):
+        if idx < 0:
+            idx = len(self) + idx
+        if idx < 0 or idx >= len(self):
             raise IndexError(
-                f'iTarDataset index out of range, {idx} >= {len(self)}.'
+                f'iTarDataset index out of range, {idx} not in [0, {len(self)}).'
             )
 
         n = self._nrealext
@@ -156,27 +149,51 @@ class iTarDataset(Dataset):
         self._trafo = _compose(self.transforms)
         return self
     
+    def _sync_extension_state(self):
+        """Resync all extension-derived metadata from self.extensions and fold state."""
+        self._real_ext = {e for e in self.extensions if e not in _valid_pseudo_extensions}
+        self._pseu_ext = {e for e in self.extensions if e in _valid_pseudo_extensions}
+        self._nrealext = len(self._real_ext)
+        if self._nrealext == 0:
+            raise ValueError('At least one real extension must be provided!')
+        self._extmap = {v: k for k, v in self.fold.state.ext2id.items()}
+        self.decoders = _parse_decoders(self.fold)
+
     def _refresh_bucketsize(self):
         computed_size = round(sum(self.shard_bincount) / (len(self.shard_bincount) * self.buckets_per_shard))
         self._bucket_size = max(1, int(computed_size))
 
     def _update_fold_state_vars(self):
-        self.shard_bincount = self.fold.bincount
-        if self.shard_bincount.sum() <= 0:
+        bincount = self.fold.bincount
+        if bincount.sum() <= 0:
             raise ValueError(
                 'Fold state has no samples! ' 
                 'This is either due to erroneous filtering or an empty dataset.'
             )
+        self.shard_bincount = bincount
         self._refresh_bucketsize()
         
     def filter_extensions(self, extensions:Sequence[str]):
-        self.fold.filter_extensions([stripext(e) for e in extensions])
+        clean = [stripext(e) for e in extensions]
+        self.fold.filter_extensions(clean)
+        self.extensions = clean
+        self._sync_extension_state()
         self._update_fold_state_vars()
+        if self.shuffle_shard_mixing and not self.fold.state.is_contiguous:
+            raise ValueError(
+                'Shard mixing requires contiguous fold state after filtering. '
+                'Reinitialize with `enforce_contiguous=True` or `shuffle_shard_mixing=False`.'
+            )
         return self
         
     def filter_stems(self, stems:Sequence[str]) -> "iTarDataset":
         self.fold.filter_stems(stems)
         self._update_fold_state_vars()
+        if self.shuffle_shard_mixing and not self.fold.state.is_contiguous:
+            raise ValueError(
+                'Shard mixing requires contiguous fold state after filtering. '
+                'Reinitialize with `enforce_contiguous=True` or `shuffle_shard_mixing=False`.'
+            )
         return self
 
     def filter_stems_by_json(self, path:str|PathLike) -> "iTarDataset":
@@ -320,7 +337,7 @@ class iTarDataset(Dataset):
         if len(maps) != num_req:
             raise ValueError(
                 f"Incorrect number of transforms provided. "
-                f"Expected {len(self.extensions)} | {num_req}, got {num_ext}."
+                f"Expected {len(self.extensions)} | {num_req}, got {len(maps)}."
             )
 
         padmaps = []
