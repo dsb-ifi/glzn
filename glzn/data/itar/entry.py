@@ -293,7 +293,7 @@ class iTarState(NamedTuple):
             is_contiguous=is_contiguous
         )
     
-    def force_contiguous(self) -> "iTarState":
+    def enforce_contiguous(self) -> "iTarState":
         if self.is_contiguous:
             return self
 

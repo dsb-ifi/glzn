@@ -46,11 +46,11 @@ class iTarDirectory:
             self._folds[k] = sorted(self._folds[k])
 
     @property
-    def folds(self):
+    def folds(self) -> list[str]:
         return list(self._folds.keys())
 
     @property
-    def nfolds(self):
+    def nfolds(self) -> int:
         return sum([len(v) for v in self._folds.values()])
 
     def has_taridx(self, idxext:str):
@@ -114,7 +114,7 @@ class iTarFold:
         self, root:PathLike, fold:str='train', delimiter:str='_',
         extension:str='tar', parse_if_missing:bool=False, serialize:bool=True,
         idxext:str='taridx', filter_extensions:Sequence[str]|None=None,
-        force_contiguous:bool=False, **kwargs
+        enforce_contiguous:bool=False, **kwargs
     ):
         self._dir = iTarDirectory(root, delimiter=delimiter, extension=extension)
         self.root = root
@@ -144,22 +144,22 @@ class iTarFold:
                 self.state = iTarState.load(Path(path))
 
         self.filter_extensions(filter_extensions)
-        if force_contiguous:
-            self.state = self.state.force_contiguous()
+        if enforce_contiguous:
+            self.state = self.state.enforce_contiguous()
 
     @property
     def _combined(self) -> list[str]:
         return self._pseudoextensions + list(self.state.ext2id.keys())
     
     @property
-    def full_paths(self):
+    def full_paths(self) -> list[Path]:
         return [Path(self.path_from_idx(i)) for i in range(len(self._paths))]
     
     @property
-    def bincount(self):
+    def bincount(self) -> np.ndarray:
         return np.bincount(self.state.arr['fid'])
     
-    def path_from_idx(self, idx) -> PathLike:
+    def path_from_idx(self, idx: int) -> PathLike:
         path = os.path.join(self.root, self._paths[idx] + f'.{self.extension}')
         return Path(path)
 

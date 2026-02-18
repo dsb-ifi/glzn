@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import getpass
-import os
 import time
+import tarfile
 import xxhash
 
+from io import BytesIO
 from pathlib import Path
 from os import PathLike
 from typing import Any, Callable, Iterable, Optional
@@ -12,9 +13,6 @@ from typing import Any, Callable, Iterable, Optional
 from .encoders import DEFAULT_ENCODERS
 from .itar.entry import iTarState
 from .itar.utils import stripext
-
-
-_BLK = 512
 
 def _normalize_ext(ext: str) -> str:
 	out = stripext(ext).lower()
@@ -26,52 +24,6 @@ def _normalize_ext(ext: str) -> str:
 def _check_flatname(name: str, what: str):
 	if '/' in name or '\\' in name:
 		raise ValueError(f'{what} must be flat (no path separators): {name!r}.')
-
-
-def _octal(value: int, width: int) -> bytes:
-	if value < 0:
-		raise ValueError('Octal fields do not support negative values.')
-	txt = f'{value:o}'.encode('ascii')
-	if len(txt) > width - 1:
-		raise ValueError(f'Value {value} does not fit in {width} byte octal field.')
-	return txt.rjust(width - 1, b'0') + b'\0'
-
-
-def _tar_header(
-	name: str,
-	size: int,
-	*,
-	mode: int,
-	uid: int,
-	gid: int,
-	mtime: int,
-	uname: str,
-	gname: str,
-) -> bytes:
-	_check_flatname(name, 'Tar member name')
-	name_bytes = name.encode('utf-8')
-	if len(name_bytes) > 100:
-		raise ValueError(
-			f'Tar member name exceeds 100 bytes and would require longname extension: {name!r}.'
-		)
-
-	hdr = bytearray(_BLK)
-	hdr[0:100] = name_bytes.ljust(100, b'\0')
-	hdr[100:108] = _octal(mode, 8)
-	hdr[108:116] = _octal(uid, 8)
-	hdr[116:124] = _octal(gid, 8)
-	hdr[124:136] = _octal(size, 12)
-	hdr[136:148] = _octal(mtime, 12)
-	hdr[148:156] = b'        '
-	hdr[156:157] = b'0'
-	hdr[257:263] = b'ustar\0'
-	hdr[263:265] = b'00'
-	hdr[265:297] = uname.encode('utf-8')[:32].ljust(32, b'\0')
-	hdr[297:329] = gname.encode('utf-8')[:32].ljust(32, b'\0')
-
-	cksum = sum(hdr)
-	hdr[148:156] = f'{cksum:06o}\0 '.encode('ascii')
-	return bytes(hdr)
 
 
 class _TarShardWriter:
@@ -87,6 +39,11 @@ class _TarShardWriter:
 		self.path = Path(path)
 		self.path.parent.mkdir(parents=True, exist_ok=True)
 		self.fileobj = open(self.path, 'wb')
+		self.tarobj = tarfile.open(
+			fileobj=self.fileobj,
+			mode='w',
+			format=tarfile.USTAR_FORMAT,
+		)
 		self.username = username
 		self.groupname = groupname
 		self.mode = mode
@@ -98,33 +55,31 @@ class _TarShardWriter:
 	def add_member(self, name: str, payload: bytes) -> tuple[int, int]:
 		if not isinstance(payload, (bytes, bytearray, memoryview)):
 			raise TypeError('Payload must be bytes-like.')
+		_check_flatname(name, 'Tar member name')
+		if len(name.encode('utf-8')) > 100:
+			raise ValueError(
+				f'Tar member name exceeds 100 bytes and would require longname extension: {name!r}.'
+			)
 
 		data = bytes(payload)
 		offset = self.fileobj.tell()
-		now = int(time.time())
-		hdr = _tar_header(
-			name,
-			len(data),
-			mode=self.mode,
-			uid=0,
-			gid=0,
-			mtime=now,
-			uname=self.username,
-			gname=self.groupname,
-		)
-		self.fileobj.write(hdr)
-		self.fileobj.write(data)
 
-		pad = (-len(data)) % _BLK
-		if pad:
-			self.fileobj.write(b'\0' * pad)
+		tarinfo = tarfile.TarInfo(name)
+		tarinfo.size = len(data)
+		tarinfo.mtime = int(time.time())
+		tarinfo.mode = self.mode
+		tarinfo.uid = 0
+		tarinfo.gid = 0
+		tarinfo.uname = self.username
+		tarinfo.gname = self.groupname
+		self.tarobj.addfile(tarinfo, BytesIO(data))
 
 		return offset, len(data)
 
 	def close(self):
 		if self.fileobj.closed:
 			return
-		self.fileobj.write(b'\0' * (_BLK * 2))
+		self.tarobj.close()
 		self.fileobj.close()
 
 
@@ -173,9 +128,10 @@ class iTarFoldWriter:
 			for ext, fn in override_encoders:
 				if not callable(fn):
 					raise TypeError(f'Encoder for {ext!r} is not callable.')
-				self.encoders[f'.{_normalize_ext(ext)}'] = fn
+				self.encoders[_normalize_ext(ext)] = fn
 
 		self.state = iTarState.empty()
+		self._ext2id: dict[str, int] = {}
 
 		self._next_shard = start
 		self._cur_shard: _TarShardWriter | None = None
@@ -183,8 +139,6 @@ class iTarFoldWriter:
 		self._cur_count = 0
 		self._closed = False
 		self.total_count = 0
-
-		self._open_new_shard()
 
 	def _shard_name(self, idx: int) -> str:
 		suffix = self.shard_pattern % idx
@@ -234,6 +188,14 @@ class iTarFoldWriter:
 		self.state.arr[self.state.pos] = (fid, offset, size, extid, crashid, keyhash)
 		self.state = self.state._replace(pos=self.state.pos + 1)
 
+	def _ensure_extid(self, ext_nodot: str) -> int:
+		extid = self._ext2id.get(ext_nodot)
+		if extid is not None:
+			return extid
+		extid = len(self._ext2id)
+		self._ext2id[ext_nodot] = extid
+		return extid
+
 	def write(self, key: str | dict[str, Any], sample: Optional[dict[str, Any]] = None):
 		if self._closed:
 			raise RuntimeError(f'{self.__class__.__name__} is already closed.')
@@ -260,6 +222,9 @@ class iTarFoldWriter:
 		if len(payloads) == 0:
 			raise ValueError('Sample payload dict cannot be empty.')
 
+		if self._cur_shard is None or self._cur_fid is None:
+			self._open_new_shard()
+
 		assert self._cur_shard is not None and self._cur_fid is not None
 		if (
 			self._cur_count >= self.shard_maxfiles or
@@ -275,7 +240,7 @@ class iTarFoldWriter:
 		for ext, obj in payloads.items():
 			ext_nodot = _normalize_ext(ext)
 			ext_with_dot = f'.{ext_nodot}'
-			encoder = self.encoders.get(ext_with_dot)
+			encoder = self.encoders.get(ext_nodot)
 			if encoder is None:
 				raise KeyError(f'No encoder registered for extension {ext_with_dot!r}.')
 
@@ -288,7 +253,7 @@ class iTarFoldWriter:
 			member_name = f'{keystr}.{ext_nodot}'
 			offset, size = self._cur_shard.add_member(member_name, bytes(encoded))
 
-			extid = self.state.ext2id.setdefault(ext_nodot, len(self.state.ext2id))
+			extid = self._ensure_extid(ext_nodot)
 			self._append_row(self._cur_fid, offset, size, extid, crashid, keyhash)
 
 		self._cur_count += 1
@@ -302,9 +267,20 @@ class iTarFoldWriter:
 		if self._closed:
 			return
 
+		if self.state.pos == 0 and self._cur_shard is None:
+			self._closed = True
+			return
+
 		if self._cur_shard is not None:
 			self._cur_shard.close()
 			self._cur_shard = None
+
+		# Sync explicit extension table into iTarState before serialization.
+		self.state = self.state._replace(ext2id={**self._ext2id})
+		if self.state.pos > 0 and len(self.state.ext2id) == 0:
+			raise RuntimeError(
+				f'Fold {self.fold!r} has {self.state.pos} rows but no registered extensions.'
+			)
 
 		self.state = self.state.finalize()
 		if self.enforce_contiguous and not self.state.is_contiguous:
@@ -320,6 +296,23 @@ class iTarFoldWriter:
 
 	def __exit__(self, exc_type, exc_value, traceback):
 		self.close()
+
+	def __repr__(self) -> str:
+		if self._cur_fid is None:
+			cur_shard = '<none>'
+		else:
+			cur_shard = self._shard_name(self._cur_fid + self.start)
+
+		cur_size = 0.0 if self._cur_shard is None else float(self._cur_shard.bytes_written)
+		return (
+			f'{self.__class__.__name__}(\n'
+			f'\tFold: {self.fold}\n'
+			f'\tCurrent Shard: {cur_shard}\n'
+			f'\tCurrent Shard Size: {cur_size / 1e9:.2f} GB\n'
+			f'\tCurrent Shard File Count: {self._cur_count}\n'
+			f'\tTotal File Count: {self.total_count}\n'
+			f')'
+		)
 
 
 class iTarDatasetWriter:

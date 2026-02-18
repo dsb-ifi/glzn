@@ -16,8 +16,6 @@ USE_TV_TENSOR = pkg_resources.parse_version(torchvision.__version__) >= pkg_reso
 _valid_pseudo_extensions = PseudoExtension._valid_pseudo_extensions
 
 
-############# Helper Functions #############
-
 def _compose(fs):
     def c(f,g):
         def c2(x):
@@ -26,7 +24,7 @@ def _compose(fs):
     return functools.reduce(c, fs, DefaultIdentity())
 
 def _parse_decoders(
-    fold:iTarFold, overrides:dict[str,Callable]|None={}
+    fold:iTarFold, overrides:dict[str,Callable]|None=None
 ) -> dict[int,Callable]:
     _dec = {**DEFAULT_DECODERS}
     if overrides is None:
@@ -36,8 +34,6 @@ def _parse_decoders(
         v:_dec[k.split(".")[-1]]
         for k,v in fold.state.ext2id.items()
     }
-
-############# Main Class #############
 
 class iTarDataset(Dataset):
 
@@ -54,10 +50,12 @@ class iTarDataset(Dataset):
         seed:int=0,
         shuffle_rows:bool=True,
         shuffle_shard_mixing:bool=True,
-        shuffle_bucket_size:int|None=None,
+        buckets_per_shard:int=2,
+        enforce_contiguous:bool=False,
         **kwargs
     ):
-        kw = {'verbose':True}; kw.update(kwargs)
+        kw = {'verbose':True, 'enforce_contiguous':enforce_contiguous}
+        kw.update(kwargs)
 
         # Init root path
         if not isinstance(loc, Path):
@@ -71,7 +69,7 @@ class iTarDataset(Dataset):
         # Init fold and retriever
         self.fold = iTarFold(
             self.root, fold, '_', 'tar', parse_if_missing,
-            serialize, idxext, None, True, **kw
+            serialize, idxext, None, **kw
         )
         self.retriever = iTarRetriever(
             self.fold.full_paths, prefer_mmap
@@ -87,6 +85,9 @@ class iTarDataset(Dataset):
         self._pseu_ext = {e for e in extensions if e in _valid_pseudo_extensions}
         self._extmap = {v:k for k,v in self.fold.state.ext2id.items()}
         self._nrealext = len(self._real_ext)
+        if self._nrealext == 0:
+            raise ValueError('At least one real extension must be provided!')
+
         self.fold.filter_extensions(self.extensions)
 
         # Init transforms
@@ -96,15 +97,21 @@ class iTarDataset(Dataset):
         # Init decoders
         self.decoders = _parse_decoders(self.fold)
 
-        # Init sampling details
-        self.shard_bincount = self.fold.bincount # Recompute if fold state changes
 
+        # Check contiguity for shard mixing
+        if shuffle_shard_mixing and not self.fold.state.is_contiguous:
+            raise ValueError(
+                'Shard mixing requires contiguous fold state! ' 
+                'Rerun with `enforce_contiguous=True` or `shuffle_shard_mixing=False`.'
+            )
+        
+        # Init sampling details
         self._epoch = 0
-        self._seed = 0
+        self._seed = seed
         self.shuffle_rows = shuffle_rows
         self.shuffle_shard_mixing = shuffle_shard_mixing
-        self._init_bucket = shuffle_bucket_size
-        self._refresh_bucketsize()
+        self.buckets_per_shard = max(1, buckets_per_shard)
+        self._update_fold_state_vars()
 
     def __len__(self):
         return len(self.fold.state.arr) // self._nrealext
@@ -150,14 +157,17 @@ class iTarDataset(Dataset):
         return self
     
     def _refresh_bucketsize(self):
-        if self._init_bucket is not None:
-            self._bucket_size = self._init_bucket
-        # Setting E[shard_size] / 2 should provide good mixing
-        self._bucket_size = int(round(sum(self.shard_bincount) / len(self.shard_bincount)) / 2)
+        computed_size = round(sum(self.shard_bincount) / (len(self.shard_bincount) * self.buckets_per_shard))
+        self._bucket_size = max(1, int(computed_size))
 
     def _update_fold_state_vars(self):
         self.shard_bincount = self.fold.bincount
-        self._bucket_size = int(round(sum(self.shard_bincount) / len(self.shard_bincount)) / 2)
+        if self.shard_bincount.sum() <= 0:
+            raise ValueError(
+                'Fold state has no samples! ' 
+                'This is either due to erroneous filtering or an empty dataset.'
+            )
+        self._refresh_bucketsize()
         
     def filter_extensions(self, extensions:Sequence[str]):
         self.fold.filter_extensions([stripext(e) for e in extensions])
