@@ -4,11 +4,15 @@ from typing import Sequence
 
 # TODO: Add fuzzy testing, random N, random rounds, random seed.
 
-def __F(x, k):
-    # Fast bijective mixing on half-words
-    return (x * 0x9E3779B97F4A7C15 + k) & mask
+np.seterr(over='ignore')
 
-def feistel(i:int, N:int, half:int, mask:int, keys:np.ndarray):
+_MULT = np.uint64(0x9E3779B97F4A7C15)
+
+def __F(x: np.uint64, k: np.uint64, mask: np.uint64) -> np.uint64:
+    # Fast bijective mixing on half-words natively in 64-bit
+    return (x * _MULT + k) & mask
+
+def feistel(i: int, N: int, half: int, mask: int, keys: np.ndarray) -> int:
     '''Feistel permutation for a single integer.
     
     Parameters
@@ -30,22 +34,24 @@ def feistel(i:int, N:int, half:int, mask:int, keys:np.ndarray):
     int
         The permuted integer in the range [0, N-1].
     '''
-    L, R = i >> half, i & mask
-    for k in keys:
-        L, R = R, L ^ __F(R, int(k))
-    y = (L << half) | R
-
-    # Cycle-walk for miss
-    while y >= N:
-        L, R = y >> half, y & mask
+    y = np.uint64(i)
+    u_N = np.uint64(N)
+    u_half = np.uint64(half)
+    u_mask = np.uint64(mask)
+    
+    while True:
+        L, R = y >> u_half, y & u_mask
         for k in keys:
-            L, R = R, L ^ __F(R, int(k))
-        y = (L << half) | R
-    return y
+            L, R = R, L ^ __F(R, k, u_mask)
+        y = (L << u_half) | R
+        if y < u_N:
+            break
+            
+    return int(y)
 
 
 def feistelvec(
-    a:np.ndarray, N:int, half:int, mask:int, keys:np.ndarray
+    a: np.ndarray, N: int, half: int, mask: int, keys: np.ndarray
 ) -> np.ndarray:
     '''Feistel permutation for a vector of integers.
 
@@ -70,26 +76,31 @@ def feistelvec(
         The permuted array of integers, with the same shape as the input array. 
         All values are in the range [0, N-1].
     '''
-    L = a >> half
-    R = a & mask
+    y = a.astype(np.uint64)
+    u_N = np.uint64(N)
+    u_half = np.uint64(half)
+    u_mask = np.uint64(mask)
+
+    L = y >> u_half
+    R = y & u_mask
     for k in keys:
-        T = __F(R, int(k))
-        L, R = R, L ^ T
-    y = (L << half) | R
-    over = y >= N
+        L, R = R, L ^ __F(R, k, u_mask) # type: ignore
+    y = (L << u_half) | R
+    
+    over = y >= u_N
     while over.any():
         o = y[over]
-        L = o >> half
-        R = o & mask
+        L = o >> u_half
+        R = o & u_mask
         for k in keys:
-            T = __F(R, int(k))
-            L, R = R, L ^ T
-        y[over] = (L << half) | R
-        over = y >= N
+            L, R = R, L ^ __F(R, k, u_mask) # type: ignore
+        y[over] = (L << u_half) | R
+        over = y >= u_N
+        
     return y
 
-class IdentitySampler:
 
+class IdentitySampler:
     '''Sampler that returns the identity permutation of integers from 0 to N-1.
 
     Parameters
@@ -111,15 +122,17 @@ class IdentitySampler:
     __len__()
         Returns the size N of the permutation.
     '''
-
-    def __init__(self, N:int):
+    def __init__(self, N: int):
         assert N > 0, "Size N must be a positive integer."
         self.N = N
 
-    def __getitem__(self, i:int) -> int:
+    def __getitem__(self, i: int) -> int:
         if i < 0 or i >= self.N:
             raise IndexError(f"Index {i} out of bounds for size {self.N}")
         return i
+    
+    def __call__(self, i: int) -> int:
+        return self.__getitem__(i)
 
     def __iter__(self):
         for i in range(self.N):
@@ -128,9 +141,14 @@ class IdentitySampler:
     def __len__(self):
         return self.N
 
+    def randperm(self) -> np.ndarray:
+        return np.arange(self.N, dtype=np.uint64)
+    
+    def refesh_keys(self, seed):
+        pass
+
 
 class FeistelSampler:
-
     '''FeistelSampler generates a pseudorandom permutation of integers from 0 to 
     N-1 using a Feistel network. It supports multiple rounds of mixing and can be
     seeded for reproducibility. The permutation is deterministic and can be 
@@ -176,8 +194,7 @@ class FeistelSampler:
         Returns a numpy array containing the permuted integers from 0 to N-1.
     
     '''
-    
-    def __init__(self, N:int, rounds:int=3, init_seed:int=0):
+    def __init__(self, N: int, rounds: int=3, init_seed: int=0):
         assert N > 0, "Size N must be a positive integer."
         self.N, self.rounds = N, rounds
         w = (N - 1).bit_length()
@@ -195,10 +212,10 @@ class FeistelSampler:
             dtype=np.uint64
         )
 
-    def __getitem__(self, i:int) -> int:
+    def __getitem__(self, i: int) -> int:
         return feistel(i, self.N, self.half, self.mask, self.keys)
 
-    def __call__(self, i:int) -> int:
+    def __call__(self, i: int) -> int:
         return self.__getitem__(i)
 
     def __iter__(self):
@@ -214,128 +231,115 @@ class FeistelSampler:
 
 
 class MultiFeistelSampler:
-
-    '''MultiFeistelSampler generates a pseudorandom permutation of integers 
-    from 0 to N-1 for multiple sequences of sizes specified in Ns. It supports 
-    multiple rounds of mixing and can be seeded for reproducibility. The 
-    permutation is deterministic and can be accessed via indexing or iteration. 
-    The randperm method returns the entire permuted array.
+    '''MultiFeistelSampler generates a pseudorandom permutation of integers in 
+    [0, N-1] using a Feistel network. It supports multiple rounds of mixing and 
+    can be seeded for reproducibility. The permutation is deterministic and can 
+    be accessed via indexing or iteration. The randperm method returns the 
+    entire permuted array.
 
     Parameters
     ----------
-    Ns : Sequence[int]
-        A sequence of positive integers specifying sizes of the permutations.
+    N : int
+        The size of the permutation. Must be a positive integer.
     rounds : int, optional
         The number of rounds in the Feistel network. More rounds generally
         lead to better mixing but may be slower. Default is 3.
     init_seed : int, optional
         The initial seed for generating the round keys. Must be a non-negative
         integer. Default is 0.
-    shuffle_outer : bool, optional
-        Whether to shuffle the order of the sequences defined by Ns. If True,
-        the order of the sequences will be shuffled using a FeistelSampler.
-        Default is False (no shuffling). 
     
     Attributes
     ----------
-    Ns : Sequence[int]
-        The sizes of the permutations for each sequence.
-    cums : np.ndarray
-        The cumulative sums of Ns, used for indexing.
-    num_Ns : int
-        The number of sequences defined by Ns.
+    N : int
+        The size of the permutation.
     rounds : int
         The number of rounds in the Feistel network.
-    half : np.ndarray
-        The number of bits in the half-word for each sequence, calculated as
-        (w + 1) // 2 where w is the bit length of the maximum N-1 in Ns.
-    mask : np.ndarray
-        The bitmask for the half-word for each sequence, calculated as
-        (1 << half) - 1.
+    half : int
+        The number of bits in the half-word, calculated as (w + 1) // 2 where w 
+        is the bit length of N-1.
+    mask : int
+        The bitmask for the half-word, calculated as (1 << half) - 1.
     keys : np.ndarray
         The round keys for the Feistel network, generated from the initial seed.
-    bucket_order : IdentitySampler or FeistelSampler
-        The sampler used to determine the order of the sequences defined by Ns.
-        If shuffle_outer is False, this will be an IdentitySampler. If
-        shuffle_outer is True, this will be a FeistelSampler.
-    
+
     Methods
     -------
     __getitem__(i)
-        Returns the permuted integer at index i for all sequences by Ns.
+        Returns the permuted integer at index i.
     __call__(i)
         Alias for __getitem__(i).
     __iter__()
-        Returns an iterator over all permuted integers for all sequences by Ns.
+        Returns an iterator over the permuted integers from 0 to N-1.
     __len__()
-        Returns the total size of the permutation, which is the sum of Ns.
+        Returns the size N of the permutation.
     randperm()
-        Returns a numpy array containing the permuted integers for all 
-        sequences by Ns.
+        Returns a numpy array containing the permuted integers from 0 to N-1.
+    
     '''
-
     def __init__(
-        self, Ns:Sequence[int], rounds:int=3, init_seed:int=0,
-        shuffle_outer:bool=False
+        self, Ns: Sequence[int], rounds: int=3, init_seed: int=0,
+        shuffle_outer: bool=False
     ):
         assert all(N > 0 for N in Ns), "All sizes must be positive integers."
         self.Ns = Ns
-        self.cums = np.cumsum(Ns)
+        # Force cumulative sums to uint64 for safe later addition
+        self.cums = np.cumsum(Ns, dtype=np.uint64) 
         self.num_Ns = len(Ns)
         self.rounds = rounds
         w = np.array([(N - 1).bit_length() for N in Ns], dtype=np.uint64)
         self.half = (w + 1) // 2
-        self.mask = (1 << self.half) - 1
+        # Explicit uint64 shifting for array masks
+        self.mask = (np.uint64(1) << self.half) - np.uint64(1)
         self.bucket_order = IdentitySampler(self.num_Ns)
         if shuffle_outer:
             self.bucket_order = FeistelSampler(self.num_Ns, rounds, 0)
         self.refesh_keys(init_seed)
     
-    def refesh_keys(self, seed:int):
+    def refesh_keys(self, seed: int):
         rng = random.Random(seed)
         r = self.rounds
         bits = self.half
         mask = self.mask
         self.keys = np.array([[
-                rng.getrandbits(bits[i]) & mask[i] 
+                # Cast bits[i] to native int to satisfy Python's random module
+                rng.getrandbits(int(bits[i])) & mask[i] 
                 for i in range(self.num_Ns)
             ] for _ in range(r)
         ], dtype=np.uint64)
         self.bucket_order.refesh_keys(seed + 1) 
     
-    def _bucket(self, i:int) -> int:
-        cums = self.cums
-        if i < 0 or i >= cums[-1]:
-            raise IndexError(
-                f"Index {i} out of bounds for cumulative sizes {cums}"
-            )
-        j = int(np.searchsorted(cums, i, side='right') - 1)
-        return self.bucket_order[j]
+    def _bucket(self, i: int) -> tuple[int, int]:
+        if i < 0 or i >= self.cums[-1]:
+            raise IndexError(f"Index {i} out of bounds")
+        j = int(np.searchsorted(self.cums, i, side='right'))
+        i_val = int(i) - int(self.cums[j-1]) if j > 0 else int(i)
+        j_val = int(self.bucket_order[j])
+        return i_val, j_val
 
-    def __getitem__(self, i:int) -> int:
-        j = self._bucket(i)
-        N, half, mask = self.Ns[j], self.half[j], self.mask[j]
+    def __getitem__(self, idx: int) -> int:
+        i, j = self._bucket(idx)
+        d = int(self.cums[j-1]) if j > 0 else 0
+        N, half, mask = self.Ns[j], int(self.half[j]), int(self.mask[j])
         keys = self.keys[:, j]
-        local_d = self.cums[j-1] if j > 0 else 0
-        return feistel(i - local_d, N, half, mask, keys) + local_d
+        return feistel(i, N, half, mask, keys) + d
 
-    def __call__(self, i:int) -> int:
+    def __call__(self, i: int) -> int:
         return self.__getitem__(i)
     
     def __iter__(self):
-        for i in range(self.cums[-1]):
+        for i in range(int(self.cums[-1])):
             yield self.__getitem__(i)
 
     def __len__(self):
-        return self.cums[-1]
+        return int(self.cums[-1])
 
     def randperm(self) -> np.ndarray:
+        order = self.bucket_order.randperm()
+        Narr = np.array(self.Ns, dtype=np.uint64)[order]
         return np.concatenate([
             feistelvec(
-                np.arange(N, dtype=np.uint64), N, self.half[j], 
-                self.mask[j], self.keys[:, j]
-            ) + np.uint64(self.cums[j-1] if j > 0 else 0)
-            for j, N in enumerate(self.Ns)
+                np.arange(N, dtype=np.uint64), N, int(self.half[j]), 
+                int(self.mask[j]), self.keys[:, j]
+            ) + (self.cums[j-1] if j > 0 else np.uint64(0))
+            for j, N in zip(order, Narr)
         ])
-        
-
