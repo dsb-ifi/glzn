@@ -22,7 +22,8 @@ def feistel(i:int, N:int, half:int, mask:int, keys:np.ndarray):
     mask : int
         The bitmask for the half-word. Must be (1 << half) - 1.
     keys : np.ndarray
-        The round keys for the Feistel network. Must be a 1D array of integers with length equal to the number of rounds.
+        The round keys for the Feistel network. Must be a 1D array of integers 
+        with length equal to the number of rounds.
     
     Returns
     -------
@@ -51,7 +52,8 @@ def feistelvec(
     Parameters
     ----------
     a : np.ndarray
-        The input array of integers to permute. Must be a 1D array of non-negative integers.
+        The input array of integers to permute. Must be a 1D array of 
+        non-negative integers.
     N : int
         The size of the permutation. Must be a positive integer.
     half : int
@@ -59,12 +61,14 @@ def feistelvec(
     mask : int
         The bitmask for the half-word. Must be (1 << half) - 1.
     keys : np.ndarray
-        The round keys for the Feistel network. Must be a 1D array of integers with length equal to the number of rounds.
+        The round keys for the Feistel network. Must be a 1D array of integers 
+        with length equal to the number of rounds.
 
     Returns
     -------
     np.ndarray
-        The permuted array of integers, with the same shape as the input array. All values are in the range [0, N-1].
+        The permuted array of integers, with the same shape as the input array. 
+        All values are in the range [0, N-1].
     '''
     L = a >> half
     R = a & mask
@@ -86,6 +90,28 @@ def feistelvec(
 
 class IdentitySampler:
 
+    '''Sampler that returns the identity permutation of integers from 0 to N-1.
+
+    Parameters
+    ----------
+    N : int
+        The size of the permutation. Must be a positive integer.
+
+    Attributes
+    ----------
+    N : int
+        The size of the permutation.
+
+    Methods
+    -------
+    __getitem__(i)
+        Returns the integer at index i, which is simply i.
+    __iter__()
+        Returns an iterator over the integers from 0 to N-1.
+    __len__()
+        Returns the size N of the permutation.
+    '''
+
     def __init__(self, N:int):
         assert N > 0, "Size N must be a positive integer."
         self.N = N
@@ -104,6 +130,51 @@ class IdentitySampler:
 
 
 class FeistelSampler:
+
+    '''FeistelSampler generates a pseudorandom permutation of integers from 0 to 
+    N-1 using a Feistel network. It supports multiple rounds of mixing and can be
+    seeded for reproducibility. The permutation is deterministic and can be 
+    accessed via indexing or iteration. The randperm method returns the entire 
+    permuted array.
+
+    Parameters
+    ----------
+    N : int
+        The size of the permutation. Must be a positive integer.
+    rounds : int, optional
+        The number of rounds in the Feistel network. More rounds generally
+        lead to better mixing but may be slower. Default is 3.
+    init_seed : int, optional
+        The initial seed for generating the round keys. Must be a non-negative
+        integer. Default is 0.
+    
+    Attributes
+    ----------
+    N : int
+        The size of the permutation.
+    rounds : int
+        The number of rounds in the Feistel network.
+    half : int
+        The number of bits in the half-word, calculated as (w + 1) // 2 where w is the bit length of N-1.
+    mask : int
+        The bitmask for the half-word, calculated as (1 << half) - 1.
+    keys : np.ndarray
+        The round keys for the Feistel network, generated from the initial seed.
+
+    Methods
+    -------
+    __getitem__(i)
+        Returns the permuted integer at index i.
+    __call__(i)
+        Alias for __getitem__(i).
+    __iter__()
+        Returns an iterator over the permuted integers from 0 to N-1.
+    __len__()
+        Returns the size N of the permutation.
+    randperm()
+        Returns a numpy array containing the permuted integers from 0 to N-1.
+    
+    '''
     
     def __init__(self, N:int, rounds:int=3, init_seed:int=0):
         assert N > 0, "Size N must be a positive integer."
@@ -142,6 +213,65 @@ class FeistelSampler:
 
 
 class MultiFeistelSampler:
+
+    '''MultiFeistelSampler generates a pseudorandom permutation of integers from 
+    0 to N-1 for multiple sequences of sizes specified in Ns. It supports 
+    multiple rounds of mixing and can be seeded for reproducibility. 
+    The permutation is deterministic and can be accessed via indexing or 
+    iteration. The randperm method returns the entire permuted array.
+
+    Parameters
+    ----------
+    Ns : Sequence[int]
+        A sequence of positive integers specifying sizes of the permutations.
+    rounds : int, optional
+        The number of rounds in the Feistel network. More rounds generally
+        lead to better mixing but may be slower. Default is 3.
+    init_seed : int, optional
+        The initial seed for generating the round keys. Must be a non-negative
+        integer. Default is 0.
+    shuffle_outer : bool, optional
+        Whether to shuffle the order of the sequences defined by Ns. If True,
+        the order of the sequences will be shuffled using a FeistelSampler.
+        Default is False (no shuffling). 
+    
+    Attributes
+    ----------
+    Ns : Sequence[int]
+        The sizes of the permutations for each sequence.
+    cums : np.ndarray
+        The cumulative sums of Ns, used for indexing.
+    num_Ns : int
+        The number of sequences defined by Ns.
+    rounds : int
+        The number of rounds in the Feistel network.
+    half : np.ndarray
+        The number of bits in the half-word for each sequence, calculated as
+        (w + 1) // 2 where w is the bit length of the maximum N-1 in Ns.
+    mask : np.ndarray
+        The bitmask for the half-word for each sequence, calculated as
+        (1 << half) - 1.
+    keys : np.ndarray
+        The round keys for the Feistel network, generated from the initial seed.
+    bucket_order : IdentitySampler or FeistelSampler
+        The sampler used to determine the order of the sequences defined by Ns.
+        If shuffle_outer is False, this will be an IdentitySampler. If
+        shuffle_outer is True, this will be a FeistelSampler.
+    
+    Methods
+    -------
+    __getitem__(i)
+        Returns the permuted integer at index i for all sequences by Ns.
+    __call__(i)
+        Alias for __getitem__(i).
+    __iter__()
+        Returns an iterator over all permuted integers for all sequences by Ns.
+    __len__()
+        Returns the total size of the permutation, which is the sum of Ns.
+    randperm()
+        Returns a numpy array containing the permuted integers for all 
+        sequences by Ns.
+    '''
 
     def __init__(
         self, Ns:Sequence[int], rounds:int=3, init_seed:int=0,
