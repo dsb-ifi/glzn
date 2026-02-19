@@ -155,7 +155,8 @@ class FeistelSampler:
     rounds : int
         The number of rounds in the Feistel network.
     half : int
-        The number of bits in the half-word, calculated as (w + 1) // 2 where w is the bit length of N-1.
+        The number of bits in the half-word, calculated as (w + 1) // 2 where w 
+        is the bit length of N-1.
     mask : int
         The bitmask for the half-word, calculated as (1 << half) - 1.
     keys : np.ndarray
@@ -214,11 +215,11 @@ class FeistelSampler:
 
 class MultiFeistelSampler:
 
-    '''MultiFeistelSampler generates a pseudorandom permutation of integers from 
-    0 to N-1 for multiple sequences of sizes specified in Ns. It supports 
-    multiple rounds of mixing and can be seeded for reproducibility. 
-    The permutation is deterministic and can be accessed via indexing or 
-    iteration. The randperm method returns the entire permuted array.
+    '''MultiFeistelSampler generates a pseudorandom permutation of integers 
+    from 0 to N-1 for multiple sequences of sizes specified in Ns. It supports 
+    multiple rounds of mixing and can be seeded for reproducibility. The 
+    permutation is deterministic and can be accessed via indexing or iteration. 
+    The randperm method returns the entire permuted array.
 
     Parameters
     ----------
