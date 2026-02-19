@@ -175,7 +175,9 @@ class MultiFeistelSampler:
     def _bucket(self, i:int) -> int:
         cums = self.cums
         if i < 0 or i >= cums[-1]:
-            raise IndexError(f"Index {i} out of bounds for cumulative sizes {cums}")
+            raise IndexError(
+                f"Index {i} out of bounds for cumulative sizes {cums}"
+            )
         j = int(np.searchsorted(cums, i, side='right') - 1)
         return self.bucket_order[j]
 
@@ -199,7 +201,8 @@ class MultiFeistelSampler:
     def randperm(self) -> np.ndarray:
         return np.concatenate([
             feistelvec(
-                np.arange(N, dtype=np.uint64), N, self.half[j], self.mask[j], self.keys[:, j]
+                np.arange(N, dtype=np.uint64), N, self.half[j], 
+                self.mask[j], self.keys[:, j]
             ) + np.uint64(self.cums[j-1] if j > 0 else 0)
             for j, N in enumerate(self.Ns)
         ])
