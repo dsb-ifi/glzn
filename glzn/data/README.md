@@ -87,6 +87,27 @@ browse_dataset(view, page_size=24, cols=6, width=128)
 Notes:
 - `BrowserWrapper` validates `img_ext` against `encoders.PIL` supported extensions.
 - Browser entries should be either `PIL.Image` or tuples where element `0` is image and element `1` is label.
+- Selection workflow in browser:
+  - Use `Select` toggles on cards to mark examples.
+  - `Only Selected` limits the gallery view to selected items.
+  - `Export Selection` creates a downloadable JSON file.
+  - `Import Selection` loads selections from a JSON upload.
+
+Selection JSON format:
+
+```json
+{
+  "version": 1,
+  "dataset": "my_dataset",
+  "fold": "train",
+  "extensions": ["jpg", "cls", "_name", "_idx"],
+  "selected": [
+    {"stem": "sample0001", "idx": 12, "fid": 0, "label": "cat"}
+  ]
+}
+```
+
+Imported entries with missing stems/indices in the current view are ignored.
 
 ## Lookup by stems
 

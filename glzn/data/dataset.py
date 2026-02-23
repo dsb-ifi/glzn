@@ -8,7 +8,8 @@ from typing import Any, Callable, Sequence, Mapping
 
 from .encoders import DEFAULT_DECODERS, PseudoExtension, PIL
 from .maptrafo import MapAll, MapGrouped, MapTuple, DefaultIdentity
-from .sampler import IdentitySampler, FeistelSampler, MultiFeistelSampler
+from .sampler import IdentitySampler, MultiFeistelSampler
+from .imgbrowser import browse_dataset
 from .itar.fold import iTarFold, iTarRetriever
 from .itar.utils import StemHelper, stripext
 
@@ -37,7 +38,7 @@ def _parse_decoders(
     }
 
 
-class BrowserWrapper:
+class _BrowserWrapper:
 
     def __init__(
         self, dataset:iTarDataset, img_ext:str='jpg', lab_ext:str='cls',
@@ -61,6 +62,12 @@ class BrowserWrapper:
         try:
             self._imgindex = dataset.extensions.index(self.img_ext)
             self._labindex = dataset.extensions.index(self.lab_ext) if self.lab_ext in dataset.extensions else None
+            self._stemindex = (
+                dataset.extensions.index('_stem') if '_stem' in dataset.extensions else
+                (dataset.extensions.index('_name') if '_name' in dataset.extensions else None)
+            )
+            self._idxindex = dataset.extensions.index('_idx') if '_idx' in dataset.extensions else None
+            self._fidindex = dataset.extensions.index('_fid') if '_fid' in dataset.extensions else None
         except:
             curext = ', '.join(dataset.extensions)
             raise ValueError(
@@ -72,12 +79,22 @@ class BrowserWrapper:
         return len(self.dataset)
 
     def __getitem__(self, i):
+        sample = self.dataset[i]
         label = None
         if self._labindex is not None:
-            label = self.dataset[i][self._labindex]
+            label = sample[self._labindex]
             if self.labeldict is not None:
                 label = self.labeldict.get(label, label)
-        return self.dataset[i][self._imgindex], label
+
+        meta = {'idx': i}
+        if self._stemindex is not None:
+            meta['stem'] = sample[self._stemindex]
+        if self._idxindex is not None:
+            meta['idx'] = int(sample[self._idxindex])
+        if self._fidindex is not None:
+            meta['fid'] = int(sample[self._fidindex])
+
+        return sample[self._imgindex], label, meta
 
 
 class iTarDataset(Dataset):
@@ -209,6 +226,18 @@ class iTarDataset(Dataset):
         self._refresh_bucketsize()
         
     def filter_extensions(self, extensions:Sequence[str]):
+        '''Filter dataset to specified extensions.
+
+        Parameters
+        ----------
+        extensions : Sequence[str]
+            Iterable of extensions to filter by. Must be a subset of the current extensions.
+
+        Returns
+        -------
+        iTarDataset
+            Updated dataset with filtered extensions.
+        '''
         clean = [stripext(e) for e in extensions]
         self.fold.filter_extensions(clean)
         self.extensions = clean
@@ -454,6 +483,35 @@ class iTarDataset(Dataset):
                 padmaps.append(DefaultIdentity())
 
         return self._add_trafo(MapTuple(padmaps))
+    
+    def browse(
+        self, img_ext:str='jpg', lab_ext:str='cls', 
+        labeldict:Mapping[Any,Any]|None=None, page_size:int=24, 
+        cols:int=6, width:int=128
+    ):
+        '''Renders a notebook-based browser for the dataset.
+
+        The browser is a convenient way to visually inspect the dataset and its samples. 
+        It displays the images along with their corresponding labels (if available) 
+        in a grid format, with support for pagination and selecting specific samples 
+        for export.
+
+        Parameters
+        ----------
+        img_ext : str, optional
+            Extension to use for images, by default 'jpg'.
+        lab_ext : str, optional
+            Extension to use for labels, by default 'cls'.
+        labeldict : Mapping[Any, Any], optional
+            Optional mapping to convert label values, by default None.
+
+        '''
+        return browse_dataset(
+            _BrowserWrapper(self, img_ext, lab_ext, labeldict),
+            page_size=page_size,
+            cols=cols,
+            width=width,
+        )
     
     @contextmanager
     def shufflecontext(
