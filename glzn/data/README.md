@@ -68,6 +68,26 @@ Constraints enforced by the writer:
 - Document format changes in `itar/README.md`.
 - Avoid breaking extension/decoder mapping compatibility.
 
+## Browsing samples
+
+Use `BrowserWrapper` together with `browse_dataset` when inspecting iTar samples.
+Labels are taken from the same iterable item as the image (no separate labels input).
+
+Example:
+
+```python
+from glzn.data.dataset import iTarDataset, BrowserWrapper
+from glzn.data.imgbrowser import browse_dataset
+
+ds = iTarDataset('my_dataset', '/data', fold='train', extensions=['jpg', 'cls'])
+view = BrowserWrapper(ds, img_ext='jpg', lab_ext='cls')
+browse_dataset(view, page_size=24, cols=6, width=128)
+```
+
+Notes:
+- `BrowserWrapper` validates `img_ext` against `encoders.PIL` supported extensions.
+- Browser entries should be either `PIL.Image` or tuples where element `0` is image and element `1` is label.
+
 ## Related docs
 
 - iTar internals: `glzn/data/itar/README.md`

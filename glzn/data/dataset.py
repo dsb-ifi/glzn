@@ -6,7 +6,7 @@ from pathlib import Path
 from os import PathLike
 from typing import Any, Callable, Sequence, Mapping
 
-from .encoders import DEFAULT_DECODERS, PseudoExtension
+from .encoders import DEFAULT_DECODERS, PseudoExtension, PIL
 from .maptrafo import MapAll, MapGrouped, MapTuple, DefaultIdentity
 from .sampler import IdentitySampler, FeistelSampler, MultiFeistelSampler
 from .itar.fold import iTarFold, iTarRetriever
@@ -23,6 +23,7 @@ def _compose(fs):
         return c2
     return functools.reduce(c, fs, DefaultIdentity())
 
+
 def _parse_decoders(
     fold:iTarFold, overrides:dict[str,Callable]|None=None
 ) -> dict[int,Callable]:
@@ -35,6 +36,7 @@ def _parse_decoders(
         for k,v in fold.state.ext2id.items()
     }
 
+
 class BrowserWrapper:
 
     def __init__(
@@ -42,17 +44,27 @@ class BrowserWrapper:
         labeldict:Mapping[Any,Any]|None=None
     ):
         self.dataset = dataset
-        self.img_ext = img_ext
-        self.lab_ext = lab_ext
+        self.img_ext = stripext(img_ext).lower()
+        self.lab_ext = stripext(lab_ext).lower()
         self.labeldict = labeldict
 
+        supported = PIL.decoder().supported_extensions
+        ext_source = supported.keys() if isinstance(supported, dict) else (supported or [])
+        valid_pil_ext = {stripext(ext).lower() for ext in ext_source}
+        if self.img_ext not in valid_pil_ext:
+            curext = ', '.join(sorted(valid_pil_ext))
+            raise ValueError(
+                f'Invalid image extension {self.img_ext}. '
+                f'Valid PIL extensions are: {curext}.'
+            )
+
         try:
-            self._imgindex = dataset.extensions.index(img_ext)
-            self._labindex = dataset.extensions.index(lab_ext) if lab_ext in dataset.extensions else None
+            self._imgindex = dataset.extensions.index(self.img_ext)
+            self._labindex = dataset.extensions.index(self.lab_ext) if self.lab_ext in dataset.extensions else None
         except:
             curext = ', '.join(dataset.extensions)
             raise ValueError(
-                f'No current extensions {img_ext}. '
+                f'No current extensions {self.img_ext}. '
                 f'Valid current extensions are: {curext}.'
             )
 
@@ -66,6 +78,7 @@ class BrowserWrapper:
             if self.labeldict is not None:
                 label = self.labeldict.get(label, label)
         return self.dataset[i][self._imgindex], label
+
 
 class iTarDataset(Dataset):
 

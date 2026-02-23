@@ -16,32 +16,39 @@ def _pil_to_bytes(img:Image.Image, fmt="png", width=None):
     return buf.getvalue()
 
 
-def browse_dataset(images, labels=None, page_size=24, cols=6, width=128):
-    '''Browses a list of PIL images in a paginated grid. Optionally, labels can be shown below each image.
+def _parse_item(item):
+    if isinstance(item, tuple):
+        if len(item) == 0:
+            raise ValueError('Dataset item tuple must contain at least one element (image).')
+        image = item[0]
+        label = item[1] if len(item) > 1 else None
+        return image, label
+    return item, None
+
+
+def browse_dataset(items, page_size=24, cols=6, width=128):
+    '''Browses an indexable iterable in a paginated grid.
+
+    Each item must be either:
+    - a PIL image
+    - a tuple where the first element is a PIL image and the second element is
+      used as label text
 
     Parameters
     ----------
-    images : list of PIL.Image
-        The images to display.
-    labels : list of str, optional
-        Optional labels to show below each image. Must be the same length as `images`.
+    items : sequence
+        Sequence of samples. Each sample is either a PIL image or a tuple of
+        `(image, label, ...)`.
     page_size : int, optional
         Number of images to show per page. Default is 24.
     cols : int, optional
         Number of columns in the grid. Default is 6.
     width : int, optional
         Maximum width of each image in pixels. Default is 128.
-
-    Raises
-    ------
-    ValueError
-        If `labels` is provided and its length does not match the length of `images`.
     '''
-    n = len(images)
-    if labels is not None and len(labels) != n:
-        raise ValueError("len(images) must equal len(labels)")
+    n = len(items)
 
-    total_pages = math.ceil(n / page_size)
+    total_pages = max(1, math.ceil(n / page_size))
     page = 1  # 1‐based page index
 
     # --- Widget elements ---
@@ -70,15 +77,20 @@ def browse_dataset(images, labels=None, page_size=24, cols=6, width=128):
             out.clear_output(wait=True)
             cells = []
             for i in range(start, end):
+                img, label = _parse_item(items[i])
+                if not isinstance(img, Image.Image):
+                    raise TypeError(
+                        f'Expected PIL.Image.Image at index {i}, got {type(img).__name__}.'
+                    )
                 img_widget = w.Image(
-                    value=_pil_to_bytes(images[i], width=width),
+                    value=_pil_to_bytes(img, width=width),
                     format="png",
                     width=width,
                 )
-                if labels is not None:
+                if label is not None:
                     cells.append(
                         w.VBox(
-                            [img_widget, w.HTML(str(labels[i]))],
+                            [img_widget, w.HTML(str(label))],
                             layout=w.Layout(align_items="center"),
                         )
                     )
@@ -95,7 +107,12 @@ def browse_dataset(images, labels=None, page_size=24, cols=6, width=128):
             display(grid)
 
         # Update the counter and the page_input if needed
-        counter.value = f"<b>{p}/{total_pages}</b>"
+        if n == 0:
+            counter.value = "<b>0 of 0</b>"
+        else:
+            display_start = start + 1
+            display_end = end
+            counter.value = f"<b>{display_start}–{display_end} of {n}</b>"
         if page_input.value != p:
             page_input.value = p
 
