@@ -8,11 +8,11 @@ np.seterr(over='ignore')
 
 _MULT = np.uint64(0x9E3779B97F4A7C15)
 
-def __F(x: np.uint64, k: np.uint64, mask: np.uint64) -> np.uint64:
+def __F(x:np.uint64, k:np.uint64, mask:np.uint64) -> np.uint64:
     # Fast bijective mixing on half-words natively in 64-bit
     return (x * _MULT + k) & mask
 
-def feistel(i: int, N: int, half: int, mask: int, keys: np.ndarray) -> int:
+def feistel(i:int, N:int, half:int, mask:int, keys:np.ndarray) -> int:
     '''Feistel permutation for a single integer.
     
     Parameters
@@ -51,7 +51,7 @@ def feistel(i: int, N: int, half: int, mask: int, keys: np.ndarray) -> int:
 
 
 def feistelvec(
-    a: np.ndarray, N: int, half: int, mask: int, keys: np.ndarray
+    a:np.ndarray, N:int, half:int, mask:int, keys:np.ndarray
 ) -> np.ndarray:
     '''Feistel permutation for a vector of integers.
 
@@ -122,16 +122,16 @@ class IdentitySampler:
     __len__()
         Returns the size N of the permutation.
     '''
-    def __init__(self, N: int):
+    def __init__(self, N:int):
         assert N > 0, "Size N must be a positive integer."
         self.N = N
 
-    def __getitem__(self, i: int) -> int:
+    def __getitem__(self, i:int) -> int:
         if i < 0 or i >= self.N:
             raise IndexError(f"Index {i} out of bounds for size {self.N}")
         return i
     
-    def __call__(self, i: int) -> int:
+    def __call__(self, i:int) -> int:
         return self.__getitem__(i)
 
     def __iter__(self):
@@ -194,7 +194,7 @@ class FeistelSampler:
         Returns a numpy array containing the permuted integers from 0 to N-1.
     
     '''
-    def __init__(self, N: int, rounds: int=3, init_seed: int=0):
+    def __init__(self, N:int, rounds:int=3, init_seed:int=0):
         assert N > 0, "Size N must be a positive integer."
         self.N, self.rounds = N, rounds
         w = (N - 1).bit_length()
@@ -212,10 +212,10 @@ class FeistelSampler:
             dtype=np.uint64
         )
 
-    def __getitem__(self, i: int) -> int:
+    def __getitem__(self, i:int) -> int:
         return feistel(i, self.N, self.half, self.mask, self.keys)
 
-    def __call__(self, i: int) -> int:
+    def __call__(self, i:int) -> int:
         return self.__getitem__(i)
 
     def __iter__(self):
@@ -277,8 +277,8 @@ class MultiFeistelSampler:
     
     '''
     def __init__(
-        self, Ns: Sequence[int], rounds: int=3, init_seed: int=0,
-        shuffle_outer: bool=False
+        self, Ns:Sequence[int], rounds:int=3, init_seed:int=0,
+        shuffle_outer:bool=False
     ):
         assert all(N > 0 for N in Ns), "All sizes must be positive integers."
         self.Ns = Ns
@@ -295,7 +295,7 @@ class MultiFeistelSampler:
             self.bucket_order = FeistelSampler(self.num_Ns, rounds, 0)
         self.refesh_keys(init_seed)
     
-    def refesh_keys(self, seed: int):
+    def refesh_keys(self, seed:int):
         rng = random.Random(seed)
         r = self.rounds
         bits = self.half
@@ -308,7 +308,7 @@ class MultiFeistelSampler:
         ], dtype=np.uint64)
         self.bucket_order.refesh_keys(seed + 1) 
     
-    def _bucket(self, i: int) -> tuple[int, int]:
+    def _bucket(self, i:int) -> tuple[int, int]:
         if i < 0 or i >= self.cums[-1]:
             raise IndexError(f"Index {i} out of bounds")
         j = int(np.searchsorted(self.cums, i, side='right'))
@@ -316,14 +316,14 @@ class MultiFeistelSampler:
         j_val = int(self.bucket_order[j])
         return i_val, j_val
 
-    def __getitem__(self, idx: int) -> int:
+    def __getitem__(self, idx:int) -> int:
         i, j = self._bucket(idx)
         d = int(self.cums[j-1]) if j > 0 else 0
         N, half, mask = self.Ns[j], int(self.half[j]), int(self.mask[j])
         keys = self.keys[:, j]
         return feistel(i, N, half, mask, keys) + d
 
-    def __call__(self, i: int) -> int:
+    def __call__(self, i:int) -> int:
         return self.__getitem__(i)
     
     def __iter__(self):
