@@ -8,7 +8,7 @@ from typing import Callable, Sequence
 
 from .encoders import DEFAULT_DECODERS, PseudoExtension
 from .maptrafo import MapAll, MapGrouped, MapTuple, DefaultIdentity
-from .sampler import JointFeistelSampler
+from .sampler import IdentitySampler, FeistelSampler, MultiFeistelSampler
 from .itar.fold import iTarFold, iTarRetriever
 from .itar.utils import StemHelper, stripext
 
@@ -47,9 +47,7 @@ class iTarDataset(Dataset):
         serialize:bool=True,
         idxext:str='taridx',
         prefer_mmap:bool=False,
-        seed:int=0,
-        shuffle_rows:bool=True,
-        shuffle_shard_mixing:bool=True,
+        internal_seed:int=0,
         buckets_per_shard:int=2,
         enforce_contiguous:bool=False,
         **kwargs
@@ -88,19 +86,9 @@ class iTarDataset(Dataset):
         self.transforms = []
         self._trafo = _compose(self.transforms)
 
-
-        # Check contiguity for shard mixing
-        if shuffle_shard_mixing and not self.fold.state.is_contiguous:
-            raise ValueError(
-                'Shard mixing requires contiguous fold state! ' 
-                'Rerun with `enforce_contiguous=True` or `shuffle_shard_mixing=False`.'
-            )
-        
         # Init sampling details
         self._epoch = 0
-        self._seed = seed
-        self.shuffle_rows = shuffle_rows
-        self.shuffle_shard_mixing = shuffle_shard_mixing
+        self._seed = internal_seed
         self.buckets_per_shard = max(1, buckets_per_shard)
         self._update_fold_state_vars()
 
@@ -114,6 +102,7 @@ class iTarDataset(Dataset):
             raise IndexError(
                 f'iTarDataset index out of range, {idx} not in [0, {len(self)}).'
             )
+        idx = self._sampler[idx]
 
         n = self._nrealext
         idx_start = idx * n
@@ -171,6 +160,7 @@ class iTarDataset(Dataset):
                 'This is either due to erroneous filtering or an empty dataset.'
             )
         self.shard_bincount = bincount
+        self._sampler = IdentitySampler(len(self))
         self._refresh_bucketsize()
         
     def filter_extensions(self, extensions:Sequence[str]):
@@ -179,21 +169,11 @@ class iTarDataset(Dataset):
         self.extensions = clean
         self._sync_extension_state()
         self._update_fold_state_vars()
-        if self.shuffle_shard_mixing and not self.fold.state.is_contiguous:
-            raise ValueError(
-                'Shard mixing requires contiguous fold state after filtering. '
-                'Reinitialize with `enforce_contiguous=True` or `shuffle_shard_mixing=False`.'
-            )
         return self
         
     def filter_stems(self, stems:Sequence[str]) -> "iTarDataset":
         self.fold.filter_stems(stems)
         self._update_fold_state_vars()
-        if self.shuffle_shard_mixing and not self.fold.state.is_contiguous:
-            raise ValueError(
-                'Shard mixing requires contiguous fold state after filtering. '
-                'Reinitialize with `enforce_contiguous=True` or `shuffle_shard_mixing=False`.'
-            )
         return self
 
     def filter_stems_by_json(self, path:str|PathLike) -> "iTarDataset":
@@ -352,7 +332,26 @@ class iTarDataset(Dataset):
         return self._add_trafo(MapTuple(padmaps))
     
     @contextmanager
-    def shufflecontext(self):
-        raise NotImplementedError()  
+    def shufflecontext(
+        self, seed:int|None=None, shard_mixing:bool=False, rounds:int=3
+    ):
+        seed = self._seed + self._epoch if seed is None else seed
+        Ns:list[int] = self.fold.bincount.tolist()
+        if shard_mixing: 
+            if not self.fold.state.is_contiguous:
+                raise ValueError(
+                    'Shard mixing requires contiguous fold state! ' 
+                    'Reinitialize dataset with `enforce_contiguous=True`.'
+                )
+            N = self._bucket_size
+            num_Ns = len(self) // N
+            last_N = len(self) % N
+            Ns = [N] * num_Ns + ([last_N] if last_N > 0 else [])
         
+        try:
+            self._sampler = MultiFeistelSampler(Ns, rounds, seed)
+            yield
+        finally:
+            self._sampler = IdentitySampler(len(self))
+            self._epoch += 1
 
