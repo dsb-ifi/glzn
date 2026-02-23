@@ -4,7 +4,7 @@ from contextlib import contextmanager
 from torch.utils.data import Dataset
 from pathlib import Path
 from os import PathLike
-from typing import Callable, Sequence
+from typing import Any, Callable, Sequence, Mapping
 
 from .encoders import DEFAULT_DECODERS, PseudoExtension
 from .maptrafo import MapAll, MapGrouped, MapTuple, DefaultIdentity
@@ -34,6 +34,38 @@ def _parse_decoders(
         v:_dec[k.split(".")[-1]]
         for k,v in fold.state.ext2id.items()
     }
+
+class BrowserWrapper:
+
+    def __init__(
+        self, dataset:iTarDataset, img_ext:str='jpg', lab_ext:str='cls',
+        labeldict:Mapping[Any,Any]|None=None
+    ):
+        self.dataset = dataset
+        self.img_ext = img_ext
+        self.lab_ext = lab_ext
+        self.labeldict = labeldict
+
+        try:
+            self._imgindex = dataset.extensions.index(img_ext)
+            self._labindex = dataset.extensions.index(lab_ext) if lab_ext in dataset.extensions else None
+        except:
+            curext = ', '.join(dataset.extensions)
+            raise ValueError(
+                f'No current extensions {img_ext}. '
+                f'Valid current extensions are: {curext}.'
+            )
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def __getitem__(self, i):
+        label = None
+        if self._labindex is not None:
+            label = self.dataset[i][self._labindex]
+            if self.labeldict is not None:
+                label = self.labeldict.get(label, label)
+        return self.dataset[i][self._imgindex], label
 
 class iTarDataset(Dataset):
 
