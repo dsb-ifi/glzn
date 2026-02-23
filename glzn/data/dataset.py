@@ -1,5 +1,5 @@
 from __future__ import annotations
-import torch, torchvision, os, pkg_resources, json, functools, inspect
+import torch, torchvision, os, pkg_resources, json, functools, inspect, xxhash, numpy as np
 from contextlib import contextmanager
 from torch.utils.data import Dataset
 from pathlib import Path
@@ -240,6 +240,85 @@ class iTarDataset(Dataset):
             raise ValueError(f'Invalid list of stems: {path}.')
 
         return self.filter_stems(stemlist)
+
+    def lookup_stems(
+        self,
+        stems:Sequence[str],
+        extensions:Sequence[str]
+    ) -> dict[str, dict[str, Any]]:
+        """Retrieve decoded files by exact stem and extension.
+
+        Parameters
+        ----------
+        stems : Sequence[str]
+            Iterable of stem names to look up.
+        extensions : Sequence[str]
+            Iterable of required extensions to retrieve.
+
+        Returns
+        -------
+        dict[str, dict[str, Any]]
+            Nested dictionary where `out[stem][ext]` is the decoded object.
+            Missing stem/extension pairs are omitted.
+        """
+        stem_list = [StemHelper(s).stem for s in stems]
+        if len(stem_list) == 0:
+            return {}
+
+        ext_list = [stripext(e).lower() for e in extensions]
+        if len(ext_list) == 0:
+            return {s: {} for s in stem_list}
+
+        ext2id = self.fold.state.ext2id
+        unknown = [e for e in ext_list if e not in ext2id]
+        if len(unknown) > 0:
+            valid = ', '.join(sorted(ext2id.keys()))
+            raise ValueError(
+                f'Unknown extensions: {unknown}. '
+                f'Valid extensions are: {valid}.'
+            )
+
+        wanted_stems = set(stem_list)
+        arr = self.fold.state.arr
+        h_vec = np.fromiter(
+            (xxhash.xxh64(s.encode()).intdigest() for s in wanted_stems),
+            dtype=arr['keyhash'].dtype
+        )
+        c_vec = np.fromiter(
+            (self.fold.state.crashstem.get(s, 0) for s in wanted_stems),
+            dtype=arr['crashid'].dtype
+        )
+        e_vec = np.fromiter(
+            (ext2id[e] for e in ext_list),
+            dtype=arr['extid'].dtype
+        )
+
+        hits = (
+            np.isin(arr['extid'], e_vec) &
+            np.isin(arr['keyhash'], h_vec) &
+            np.isin(arr['crashid'], c_vec)
+        )
+
+        if not hits.any():
+            return {s: {} for s in stem_list}
+
+        rows = arr[hits]
+
+        out:dict[str, dict[str, Any]] = {s: {} for s in stem_list}
+        decoders = _parse_decoders(self.fold)
+        id2ext = {v:k for k,v in ext2id.items()}
+
+        for row in rows:
+            stem_on_disk = self.retriever.hdrname(row)
+            if stem_on_disk not in wanted_stems:
+                continue
+
+            ext = id2ext[int(row['extid'])]
+            out[stem_on_disk][ext] = decoders[int(row['extid'])](
+                bytes(self.retriever.from_row(row))
+            )
+
+        return out
 
     def map(self, mapping:Callable) -> "iTarDataset":
         '''Takes a mapping and applies it to the tuple of extensions.

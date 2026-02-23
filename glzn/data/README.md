@@ -88,6 +88,26 @@ Notes:
 - `BrowserWrapper` validates `img_ext` against `encoders.PIL` supported extensions.
 - Browser entries should be either `PIL.Image` or tuples where element `0` is image and element `1` is label.
 
+## Lookup by stems
+
+Use `iTarDataset.lookup_stems(stems, extensions)` to retrieve specific files by
+exact stem names without modifying active dataset filters.
+
+Example:
+
+```python
+from glzn.data.dataset import iTarDataset
+
+ds = iTarDataset('my_dataset', '/data', fold='train', extensions=['jpg', 'cls'])
+out = ds.lookup_stems(['sample0001', 'sample0002'], ['jpg', 'cls'])
+
+# out['sample0001']['jpg'] -> decoded PIL image
+# out['sample0001']['cls'] -> decoded class label
+```
+
+The returned structure is `dict[stem][extension] = decoded_object`.
+Missing pairs are omitted as empty/missing extension entries.
+
 ## Related docs
 
 - iTar internals: `glzn/data/itar/README.md`
