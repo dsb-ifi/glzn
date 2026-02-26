@@ -58,7 +58,7 @@ with iTarDatasetWriter('my_dataset', '/data', folds=['train', 'val', 'test']) as
 Constraints enforced by the writer:
 - no compression (`.tar` only),
 - flat names (no path separators),
-- sample keys must not contain `.`,
+- sample keys / stems must not contain `.`,
 - tar member names must fit standard header name limits (<= 100 bytes).
 
 ## Conventions
@@ -67,6 +67,49 @@ Constraints enforced by the writer:
 - Prefer additive changes in serialization/index formats.
 - Document format changes in `itar/README.md`.
 - Avoid breaking extension/decoder mapping compatibility.
+
+## Grouping mode (opt-in)
+
+Grouping is a niche feature and is intentionally not part of standard dataset
+initialization. Configure all filtering first, then activate grouping explicitly:
+
+```python
+ds = iTarDataset(
+  'my_dataset', 
+  '/data', 
+  fold='train', 
+  extensions=[
+    'f0.jpg', 'f0.cls', 
+    'f1.jpg', 'f1.cls',
+    ...
+    'f10.jpg', 'f10.cls',
+  ]
+)
+ds = ds.filter_stems([
+  'sample0001', 
+  'sample0002',
+  ...
+])
+ds = ds.add_grouping(
+  ['{0}.jpg', '{0}.cls', '{1}.jpg', '{1}.cls'], 
+  grouping_replace=False
+)
+```
+
+The example above then provides samples on the form:
+
+```
+('sampleXXXX.fY.jpg', 'sampleXXXX.fY.cls', 'sampleXXXX.fZ.jpg', 'sampleXXXX.fZ.cls')
+```
+
+which is useful for multipair datasets, such as video frame data, or multipose data such as 3DIEBench.
+
+Rules:
+- grouping is activated only via `add_grouping(...)`;
+- pseudoextensions are not supported in grouping mode;
+- filtering (`filter_extensions`, `filter_stems`, `filter_stems_by_json`) is disallowed after grouping;
+- mapping transforms are disallowed before grouping and validated against grouped output arity once grouping is active;
+- grouping validates satisfiability up-front, including slot feasibility for `grouping_replace=False`.
 
 ## Browsing samples
 
@@ -114,7 +157,7 @@ Imported entries with missing stems/indices in the current view are ignored.
 Use `iTarDataset.lookup_stems(stems, extensions)` to retrieve specific files by
 exact stem names without modifying active dataset filters.
 
-Example:
+**Example:**
 
 ```python
 from glzn.data.dataset import iTarDataset

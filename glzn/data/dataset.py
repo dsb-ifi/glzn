@@ -1,5 +1,5 @@
 from __future__ import annotations
-import torch, torchvision, os, pkg_resources, json, functools, inspect, xxhash, numpy as np
+import string, torchvision, pkg_resources, json, functools, inspect, xxhash, numpy as np
 from contextlib import contextmanager
 from torch.utils.data import Dataset
 from pathlib import Path
@@ -16,6 +16,9 @@ from .itar.utils import StemHelper, stripext
 USE_TV_TENSOR = pkg_resources.parse_version(torchvision.__version__) >= pkg_resources.parse_version('0.16')
 _valid_pseudo_extensions = PseudoExtension._valid_pseudo_extensions
 
+
+# TODO: Possibly Pseudoepoch: A selected artificial number of samples that can be anything, 
+# including infinity for a fully stochastic stream-based sampling procedure.
 
 def _compose(fs):
     def c(f,g):
@@ -154,6 +157,13 @@ class iTarDataset(Dataset):
         self.buckets_per_shard = max(1, buckets_per_shard)
         self._update_fold_state_vars()
 
+        # Grouping is an explicit opt-in mode initialized via add_grouping().
+        self.grouping:tuple[str,...]|None = None
+        self.grouping_replace = False
+        self._group_slots = 0
+        self._group_prefixes:tuple[str,...] = tuple()
+        self._grouping_active = False
+
     def __len__(self):
         return len(self.fold.state.arr) // self._nrealext
 
@@ -166,6 +176,11 @@ class iTarDataset(Dataset):
             )
         idx = self._sampler[idx]
 
+        if self._grouping_active:
+            return self._getitem_grouped(idx)
+        return self._getitem_standard(idx)
+
+    def _getitem_standard(self, idx:int) -> tuple:
         n = self._nrealext
         idx_start = idx * n
         out = {}
@@ -174,9 +189,10 @@ class iTarDataset(Dataset):
 
         for row in self.fold.state.arr[idx_start:idx_start+n]:
             extid = row['extid']
+            ext = self._extmap[extid]
             fid = row['fid'] if fid is None else fid
             stem = self.retriever.hdrname(row) if stem is None else stem
-            out[self._extmap[extid]] = self.decoders[extid](bytes(self.retriever.from_row(row)))
+            out[ext] = self.decoders[extid](bytes(self.retriever.from_row(row)))
 
         for ext in self._pseu_ext:
             match ext:
@@ -188,6 +204,22 @@ class iTarDataset(Dataset):
                     out[ext] = int(fid) if fid is not None else None
 
         return tuple(self._trafo([out[e] for e in self.extensions]))
+
+    def _getitem_grouped(self, idx:int) -> tuple:
+        n = self._nrealext
+        idx_start = idx * n
+        out = {}
+        extensions = self._sample_ext_groups()
+        extensions_set = set(extensions)
+
+        for row in self.fold.state.arr[idx_start:idx_start+n]:
+            extid = row['extid']
+            ext = self._extmap[extid]
+            if ext not in extensions_set:
+                continue
+            out[ext] = self.decoders[extid](bytes(self.retriever.from_row(row)))
+
+        return tuple(self._trafo([out[e] for e in extensions]))
 
     @staticmethod
     def supports_tv_tensor() -> bool:
@@ -224,6 +256,184 @@ class iTarDataset(Dataset):
         self.shard_bincount = bincount
         self._sampler = IdentitySampler(len(self))
         self._refresh_bucketsize()
+
+    def _assert_grouping_inactive(self, caller:str):
+        if self._grouping_active:
+            raise RuntimeError(
+                f'{caller} is unavailable after add_grouping() activation. '
+                f'Configure all filters before enabling grouping.'
+            )
+
+    def _assert_grouping_active_for_map(self, caller:str):
+        if not self._grouping_active:
+            raise RuntimeError(
+                f'{caller} requires active grouping mode. '
+                f'Call add_grouping(...) before adding transforms.'
+            )
+
+    def _expected_output_arity(self) -> int:
+        if self._grouping_active and self.grouping is not None:
+            return len(self.grouping)
+        return len(self.extensions)
+
+    def _has_distinct_slot_assignment(
+        self,
+        slot_candidates:dict[int, tuple[str,...]]
+    ) -> bool:
+        slots = sorted(slot_candidates.keys(), key=lambda i: len(slot_candidates[i]))
+        used:set[str] = set()
+
+        def _dfs(k:int) -> bool:
+            if k == len(slots):
+                return True
+            slot = slots[k]
+            for prefix in slot_candidates[slot]:
+                if prefix in used:
+                    continue
+                used.add(prefix)
+                if _dfs(k + 1):
+                    return True
+                used.remove(prefix)
+            return False
+
+        return _dfs(0)
+
+    def _infer_grouping(self, seq_str:tuple[str,...]|None) -> int:
+        if seq_str is None:
+            return 0
+        fmt_str = ','.join(seq_str)
+        formatter = string.Formatter()
+        fields = [
+            field_name for _, field_name, _, _ 
+            in formatter.parse(fmt_str) 
+            if field_name is not None
+        ]
+        if not all(f.isdigit() for f in fields):
+            raise ValueError(
+                f'Invalid grouping format string: {fmt_str}. '
+                f'All fields must be digit-only strings.'
+            )
+
+        unique_indices = {int(f) for f in fields if f.isdigit()}
+        num_slots = len(unique_indices) if unique_indices else 0
+
+        if not all(r == i for r, i in enumerate(sorted(unique_indices))):
+            raise ValueError(
+                f'Grouping format string fields must be a contiguous '
+                f'sequence of integers starting from 0. '
+                f'Got indices: {sorted(unique_indices)}.'
+            )
+
+        return num_slots
+
+    def _check_grouping_validity(
+        self,
+        grouping:tuple[str,...],
+        group_slots:int,
+        grouping_replace:bool,
+    ) -> tuple[str,...]:
+        if len(self._pseu_ext) > 0:
+            raise ValueError(
+                'Grouping mode does not support pseudoextensions. '
+                f'Remove pseudoextensions first: {sorted(self._pseu_ext)}.'
+            )
+
+        if len(grouping) == 0:
+            raise ValueError('Grouping cannot be empty.')
+        if group_slots <= 0:
+            raise ValueError(
+                'Grouping must include at least one numeric format field '
+                '(e.g. "{0}.jpg").'
+            )
+
+        if not all(len(e.split('.')) == 2 for e in self._real_ext):
+            raise ValueError(
+                'Grouping requires real extensions to have "prefix.suffix" format, '
+                'for example "a.jpg" or "b.cls".'
+            )
+
+        formatter = string.Formatter()
+        prefix_to_suffixes:dict[str, set[str]] = {}
+        for ext in self._real_ext:
+            prefix, suffix = ext.split('.')
+            prefix_to_suffixes.setdefault(prefix, set()).add(suffix)
+
+        slot_suffixes:dict[int, set[str]] = {i: set() for i in range(group_slots)}
+        for spec in grouping:
+            parts = spec.split('.')
+            if len(parts) != 2:
+                raise ValueError(
+                    f'Invalid grouping spec {spec}. Expected exactly one dot, e.g. "{{0}}.jpg".'
+                )
+            suffix = parts[1]
+            fields = [
+                field_name for _, field_name, _, _
+                in formatter.parse(spec)
+                if field_name is not None
+            ]
+            if len(fields) == 0:
+                raise ValueError(
+                    f'Invalid grouping spec {spec}. '
+                    'Each grouping element must reference at least one slot.'
+                )
+            for field in fields:
+                slot_suffixes[int(field)].add(suffix)
+
+        slot_candidates:dict[int, tuple[str,...]] = {}
+        for slot, req_suffixes in slot_suffixes.items():
+            valid = tuple(
+                sorted(
+                    p for p, suffixes in prefix_to_suffixes.items()
+                    if req_suffixes.issubset(suffixes)
+                )
+            )
+            if len(valid) == 0:
+                raise ValueError(
+                    f'Grouping slot {{{slot}}} is unsatisfiable. '
+                    f'No prefix supports required suffixes {sorted(req_suffixes)}.'
+                )
+            slot_candidates[slot] = valid
+
+        prefixes = tuple(sorted(prefix_to_suffixes.keys()))
+        if not grouping_replace:
+            if group_slots > len(prefixes):
+                raise ValueError(
+                    f'Grouping needs {group_slots} unique prefixes but only '
+                    f'{len(prefixes)} are available when grouping_replace=False.'
+                )
+            if not self._has_distinct_slot_assignment(slot_candidates):
+                raise ValueError(
+                    'Grouping is unsatisfiable with grouping_replace=False. '
+                    'No unique prefix assignment satisfies all slot requirements.'
+                )
+
+        return prefixes
+
+    def add_grouping(
+        self,
+        grouping:Sequence[str],
+        grouping_replace:bool=False,
+    ) -> 'iTarDataset':
+        group = tuple(grouping)
+        group_slots = self._infer_grouping(group)
+        prefixes = self._check_grouping_validity(group, group_slots, grouping_replace)
+
+        self.grouping = group
+        self.grouping_replace = grouping_replace
+        self._group_slots = group_slots
+        self._group_prefixes = prefixes
+        self._grouping_active = True
+        return self
+
+    def _sample_ext_groups(self) -> tuple[str,...]:
+        if not self._grouping_active or self.grouping is None:
+            return tuple(self.extensions)
+        _sample = np.random.choice(
+            self._group_prefixes,
+            self._group_slots, 
+            replace=self.grouping_replace
+        ).tolist()
+        return tuple(map(lambda s: s.format(*_sample), self.grouping))
         
     def filter_extensions(self, extensions:Sequence[str]):
         '''Filter dataset to specified extensions.
@@ -238,6 +448,7 @@ class iTarDataset(Dataset):
         iTarDataset
             Updated dataset with filtered extensions.
         '''
+        self._assert_grouping_inactive('filter_extensions()')
         clean = [stripext(e) for e in extensions]
         self.fold.filter_extensions(clean)
         self.extensions = clean
@@ -246,11 +457,26 @@ class iTarDataset(Dataset):
         return self
         
     def filter_stems(self, stems:Sequence[str]) -> "iTarDataset":
+        '''Filter dataset to specified stems.
+
+        Parameters
+        ----------
+        stems : Sequence[str]
+            Iterable of stem names to filter by. Must be a subset of the current stems.
+
+        Returns
+        -------
+        iTarDataset
+            Updated dataset with filtered stems.
+        '''
+        self._assert_grouping_inactive('filter_stems()')
         self.fold.filter_stems(stems)
         self._update_fold_state_vars()
         return self
 
     def filter_stems_by_json(self, path:str|PathLike) -> "iTarDataset":
+        # TODO: Unfortunate naming; clashes with the export functionality of the browser.
+        self._assert_grouping_inactive('filter_stems_by_json()')
         if not isinstance(path, Path):
             path = Path(path)
 
@@ -365,6 +591,7 @@ class iTarDataset(Dataset):
         iTarDataset
             Updated dataset with added transformations.
         '''
+        self._assert_grouping_active_for_map('map()')
         if not callable(mapping):
             raise TypeError("Provided mapping is not callable.")
 
@@ -373,7 +600,7 @@ class iTarDataset(Dataset):
             p for p in sig.parameters.values()
             if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)
         ]
-        n_expected = len(self.extensions)
+        n_expected = self._expected_output_arity()
         n_actual = len(params)
 
         has_varargs = any(p.kind == p.VAR_POSITIONAL for p in sig.parameters.values())
@@ -400,6 +627,7 @@ class iTarDataset(Dataset):
         iTarDataset
             Updated dataset with added transformations.
         '''
+        self._assert_grouping_active_for_map('map_all()')
         if not callable(mapping):
             raise TypeError("Provided mapping is not callable.")
         return self._add_trafo(MapAll(mapping))
@@ -422,6 +650,7 @@ class iTarDataset(Dataset):
         iTarDataset
             Updated dataset with added transformations.
         '''
+        self._assert_grouping_active_for_map('map_group()')
         if not callable(mapping):
             raise TypeError("Provided mapping is not callable.")
         return self._add_trafo(MapGrouped(mapping, indices))
@@ -454,35 +683,16 @@ class iTarDataset(Dataset):
         iTarDataset
             Updated dataset with added transformations.
         """
+        self._assert_grouping_active_for_map('map_tuple()')
         if not all(callable(m) for m in maps):
             raise TypeError("One or more mapping is not callable.")
-        num_ext = len(self.extensions)
-        if len(maps) == num_ext:
-            self._add_trafo(MapTuple(maps))
-            return self
-
-        req_extensions = [
-            (e, 1 - DEFAULT_DECODERS[e]._default_to_identity)
-            for e in self.extensions
-        ]
-        num_req = sum(map(lambda x: x[-1], req_extensions))
-
-        if len(maps) != num_req:
+        num_ext = self._expected_output_arity()
+        if len(maps) != num_ext:
             raise ValueError(
                 f"Incorrect number of transforms provided. "
-                f"Expected {len(self.extensions)} | {num_req}, got {len(maps)}."
+                f"Expected {num_ext}, got {len(maps)}."
             )
-
-        padmaps = []
-        j = 0
-        for _, d in req_extensions:
-            if d:
-                padmaps.append(maps[j])
-                j += 1
-            else:
-                padmaps.append(DefaultIdentity())
-
-        return self._add_trafo(MapTuple(padmaps))
+        return self._add_trafo(MapTuple(maps))
     
     def browse(
         self, img_ext:str='jpg', lab_ext:str='cls', 
