@@ -154,6 +154,7 @@ class iTarDataset(Dataset):
         # Init sampling details
         self._epoch = 0
         self._seed = internal_seed
+        self._grouping_seed = internal_seed ^ 0xBAD5EED
         self.buckets_per_shard = max(1, buckets_per_shard)
         self._update_fold_state_vars()
 
@@ -209,7 +210,7 @@ class iTarDataset(Dataset):
         n = self._nrealext
         idx_start = idx * n
         out = {}
-        extensions = self._sample_ext_groups()
+        extensions = self._sample_ext_groups(idx)
         extensions_set = set(extensions)
 
         for row in self.fold.state.arr[idx_start:idx_start+n]:
@@ -413,6 +414,7 @@ class iTarDataset(Dataset):
         self,
         grouping:Sequence[str],
         grouping_replace:bool=False,
+        grouping_seed:int|None=None,
     ) -> 'iTarDataset':
         group = tuple(grouping)
         group_slots = self._infer_grouping(group)
@@ -423,12 +425,14 @@ class iTarDataset(Dataset):
         self._group_slots = group_slots
         self._group_prefixes = prefixes
         self._grouping_active = True
+        self._grouping_seed = self._grouping_seed if grouping_seed is None else grouping_seed
         return self
 
-    def _sample_ext_groups(self) -> tuple[str,...]:
+    def _sample_ext_groups(self, idx:int) -> tuple[str,...]:
         if not self._grouping_active or self.grouping is None:
             return tuple(self.extensions)
-        _sample = np.random.choice(
+        s = (self._grouping_seed + self._epoch + idx) & ((1 << 64) - 1)
+        _sample = np.random.default_rng(s).choice(
             self._group_prefixes,
             self._group_slots, 
             replace=self.grouping_replace
