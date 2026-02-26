@@ -277,28 +277,6 @@ class iTarDataset(Dataset):
             return len(self.grouping)
         return len(self.extensions)
 
-    def _has_distinct_slot_assignment(
-        self,
-        slot_candidates:dict[int, tuple[str,...]]
-    ) -> bool:
-        slots = sorted(slot_candidates.keys(), key=lambda i: len(slot_candidates[i]))
-        used:set[str] = set()
-
-        def _dfs(k:int) -> bool:
-            if k == len(slots):
-                return True
-            slot = slots[k]
-            for prefix in slot_candidates[slot]:
-                if prefix in used:
-                    continue
-                used.add(prefix)
-                if _dfs(k + 1):
-                    return True
-                used.remove(prefix)
-            return False
-
-        return _dfs(0)
-
     def _infer_grouping(self, seq_str:tuple[str,...]|None) -> int:
         if seq_str is None:
             return 0
@@ -395,17 +373,23 @@ class iTarDataset(Dataset):
                 )
             slot_candidates[slot] = valid
 
-        prefixes = tuple(sorted(prefix_to_suffixes.keys()))
+        unique_suffix_sets = {
+            tuple(sorted(req_suffixes))
+            for req_suffixes in slot_suffixes.values()
+        }
+        if len(unique_suffix_sets) != 1:
+            raise ValueError(
+                'Grouping currently requires symmetric slot requirements. '
+                'Each slot must require the same set of suffixes. '
+                'For example: ("{0}.jpg", "{0}.npy", "{1}.jpg", "{1}.npy").'
+            )
+
+        prefixes = slot_candidates[0]
         if not grouping_replace:
             if group_slots > len(prefixes):
                 raise ValueError(
                     f'Grouping needs {group_slots} unique prefixes but only '
                     f'{len(prefixes)} are available when grouping_replace=False.'
-                )
-            if not self._has_distinct_slot_assignment(slot_candidates):
-                raise ValueError(
-                    'Grouping is unsatisfiable with grouping_replace=False. '
-                    'No unique prefix assignment satisfies all slot requirements.'
                 )
 
         return prefixes
@@ -416,6 +400,31 @@ class iTarDataset(Dataset):
         grouping_replace:bool=False,
         grouping_seed:int|None=None,
     ) -> 'iTarDataset':
+        '''Activate grouped extension sampling.
+
+        Parameters
+        ----------
+        grouping : Sequence[str]
+            Grouping format specification using positional fields, for example
+            ``['{0}.jpg', '{0}.npy', '{1}.jpg', '{1}.npy']``.
+            Fields must be a contiguous sequence starting at 0.
+        grouping_replace : bool, optional
+            Whether slot prefixes are sampled with replacement, by default False.
+        grouping_seed : int | None, optional
+            Optional seed override for grouped sampling. If None, keeps the
+            existing internal grouping seed.
+
+        Returns
+        -------
+        iTarDataset
+            Dataset instance with grouping mode activated.
+
+        Notes
+        -----
+        Grouping does not change dataset cardinality (``__len__``).
+        Grouped sampling is deterministic per dataset state, epoch, and sampled
+        index.
+        '''
         group = tuple(grouping)
         group_slots = self._infer_grouping(group)
         prefixes = self._check_grouping_validity(group, group_slots, grouping_replace)
@@ -429,6 +438,11 @@ class iTarDataset(Dataset):
         return self
 
     def _sample_ext_groups(self, idx:int) -> tuple[str,...]:
+        '''Sample grouped extensions for a single dataset index.
+
+        Sampling is deterministic with respect to grouping seed, epoch, and
+        sampled index.
+        '''
         if not self._grouping_active or self.grouping is None:
             return tuple(self.extensions)
         s = (self._grouping_seed + self._epoch + idx) & ((1 << 64) - 1)

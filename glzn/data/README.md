@@ -92,7 +92,8 @@ ds = ds.filter_stems([
 ])
 ds = ds.add_grouping(
   ['{0}.jpg', '{0}.cls', '{1}.jpg', '{1}.cls'], 
-  grouping_replace=False
+  grouping_replace=False,
+  grouping_seed=42 # For reproducibility
 )
 ```
 
@@ -102,14 +103,27 @@ The example above then provides samples on the form:
 ('sampleXXXX.fY.jpg', 'sampleXXXX.fY.cls', 'sampleXXXX.fZ.jpg', 'sampleXXXX.fZ.cls')
 ```
 
-which is useful for multipair datasets, such as video frame data, or multipose data such as 3DIEBench.
+where `X` is the sample and `Y`,`Z` are sampled extension prefixes based on the given grouping seed and indices.
+This is useful for multipair datasets, such as video frame data, or multipose data such as 3DIEBench.
 
 Rules:
 - grouping is activated only via `add_grouping(...)`;
 - pseudoextensions are not supported in grouping mode;
 - filtering (`filter_extensions`, `filter_stems`, `filter_stems_by_json`) is disallowed after grouping;
 - mapping transforms are disallowed before grouping and validated against grouped output arity once grouping is active;
-- grouping validates satisfiability up-front, including slot feasibility for `grouping_replace=False`.
+- grouping does not change dataset cardinality (`__len__`);
+- grouping templates are positional (for example `{0}`, `{1}`) and must use contiguous slot indices from `0`;
+- grouping currently requires symmetric slot requirements (all slots must require the same suffix set);
+- grouped sampling is deterministic per dataset state, epoch, and sampled index;
+- `grouping_seed` can be supplied to `add_grouping(..., grouping_seed=...)` to override internal grouped sampling seed.
+
+Example of an invalid asymmetric template (fails fast):
+
+```python
+ds.add_grouping(['{0}.jpg', '{0}.npy', '{1}.jpg', '{1}.seg16'])
+```
+
+The template above is rejected because slot `0` requires `{jpg, npy}` while slot `1` requires `{jpg, seg16}`.
 
 ## Browsing samples
 
