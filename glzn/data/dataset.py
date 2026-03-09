@@ -516,17 +516,19 @@ class iTarDataset(Dataset):
 
     def lookup_stems(
         self,
-        stems:Sequence[str],
-        extensions:Sequence[str]
+        stems:Sequence[str]|str|PathLike,
+        extensions:Sequence[str]|None=None
     ) -> dict[str, dict[str, Any]]:
         """Retrieve decoded files by exact stem and extension.
 
         Parameters
         ----------
-        stems : Sequence[str]
-            Iterable of stem names to look up.
-        extensions : Sequence[str]
-            Iterable of required extensions to retrieve.
+        stems : Sequence[str] | str | PathLike
+            Either an iterable of stem names or a JSON file path containing a
+            list of stem strings.
+        extensions : Sequence[str], optional
+            Iterable of required extensions to retrieve. If omitted, defaults
+            to current real dataset extensions.
 
         Returns
         -------
@@ -534,9 +536,40 @@ class iTarDataset(Dataset):
             Nested dictionary where `out[stem][ext]` is the decoded object.
             Missing stem/extension pairs are omitted.
         """
-        stem_list = [StemHelper(s).stem for s in stems]
+        stem_src = stems
+        if isinstance(stems, (str, PathLike, Path)):
+            path = Path(stems)
+            if path.exists() and path.is_file():
+                try:
+                    with open(path, 'r') as infile:
+                        loaded = json.load(infile)
+                except Exception as exc:
+                    raise ValueError(f'Failed reading stems JSON file {path}: {exc}') from exc
+
+                if not (isinstance(loaded, list) and all(isinstance(k, str) for k in loaded)):
+                    raise ValueError(
+                        f'Invalid stems JSON file {path}: expected list[str].'
+                    )
+                stem_src = loaded
+
+        if not isinstance(stem_src, Sequence):
+            raise TypeError(
+                'Expected stems to be a sequence of strings or a JSON file path.'
+            )
+        if not all(isinstance(s, str) for s in stem_src):
+            raise TypeError(
+                'Expected all stems to be strings.'
+            )
+
+        stem_list = [StemHelper(s).stem for s in stem_src]
         if len(stem_list) == 0:
             return {}
+
+        if extensions is None:
+            extensions = [
+                e for e in self.extensions
+                if e not in _valid_pseudo_extensions and e in self.fold.state.ext2id
+            ]
 
         ext_list = [stripext(e).lower() for e in extensions]
         if len(ext_list) == 0:

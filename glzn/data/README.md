@@ -147,29 +147,29 @@ Notes:
 - Selection workflow in browser:
   - Use `Select` toggles on cards to mark examples.
   - `Only Selected` limits the gallery view to selected items.
-  - `Export Selection` creates a downloadable JSON file.
-  - `Import Selection` loads selections from a JSON upload.
+  - `Export Selection` creates a downloadable JSON list of selected stems.
+  - `Import Selection` loads selections from a JSON list upload.
 
 Selection JSON format:
 
 ```json
-{
-  "version": 1,
-  "dataset": "my_dataset",
-  "fold": "train",
-  "extensions": ["jpg", "cls", "_name", "_idx"],
-  "selected": [
-    {"stem": "sample0001", "idx": 12, "fid": 0, "label": "cat"}
-  ]
-}
+["sample0001", "sample0002", "sample0100"]
 ```
 
-Imported entries with missing stems/indices in the current view are ignored.
+Imported entries with missing stems in the current view are ignored.
+Legacy verbose object formats are not accepted by import.
 
 ## Lookup by stems
 
-Use `iTarDataset.lookup_stems(stems, extensions)` to retrieve specific files by
-exact stem names without modifying active dataset filters.
+Use `iTarDataset.lookup_stems(stems, extensions=None)` to retrieve specific
+files by exact stem names without modifying active dataset filters.
+
+`stems` can be either:
+- a list of stem strings, or
+- a path to a JSON file containing a list of stem strings (for example, an
+  export from the browser selection tool).
+
+If `extensions` is omitted, the current real dataset extensions are used.
 
 **Example:**
 
@@ -178,6 +178,12 @@ from glzn.data.dataset import iTarDataset
 
 ds = iTarDataset('my_dataset', '/data', fold='train', extensions=['jpg', 'cls'])
 out = ds.lookup_stems(['sample0001', 'sample0002'], ['jpg', 'cls'])
+
+# Path-based input from browser-exported stems JSON
+out2 = ds.lookup_stems('selection.json', ['jpg', 'cls'])
+
+# Uses current real dataset extensions by default
+out3 = ds.lookup_stems('selection.json')
 
 # out['sample0001']['jpg'] -> decoded PIL image
 # out['sample0001']['cls'] -> decoded class label

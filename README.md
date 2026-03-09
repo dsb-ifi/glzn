@@ -14,7 +14,7 @@ The name `glzn` is a textese disemvowelment of *glissen*, meaning sparse in Norw
 
 ## Goal and Scope
 
-`glzn` is packaged in submodules, each designed to facilitate a specific role in running machine learning experiments, primarily with PyTorch.
+`glzn` is packaged in submodules, each designed to facilitate a specific role in running machine learning experiments with PyTorch.
 
 - `glzn.data`: [WDS](https://github.com/webdataset/webdataset) format data wrapper for handling data of different modalities.
 - `glzn.log`: local logging functionality, can be paired with [Aim](https://github.com/aimhubio/aim) for more extensive reporting.

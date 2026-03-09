@@ -64,7 +64,14 @@ def _key_from_meta(idx, meta):
     return f'idx:{idx}'
 
 
-def _extract_upload_bytes(value):
+def _extract_upload_bytes(upload):
+    data = getattr(upload, 'data', None)
+    if isinstance(data, (list, tuple)) and len(data) > 0:
+        first = data[0]
+        if isinstance(first, (bytes, bytearray, memoryview)):
+            return bytes(first)
+
+    value = getattr(upload, 'value', upload)
     if isinstance(value, dict):
         values = value.values()
     elif isinstance(value, (list, tuple)):
@@ -75,12 +82,15 @@ def _extract_upload_bytes(value):
     for obj in values:
         if isinstance(obj, Mapping):
             content = obj.get('content')
-            if content is not None:
-                return bytes(content)
         else:
             content = getattr(obj, 'content', None)
-            if content is not None:
-                return bytes(content)
+
+        if content is None:
+            continue
+        if isinstance(content, (bytes, bytearray, memoryview)):
+            return bytes(content)
+        if isinstance(content, str):
+            return content.encode('utf8')
     return None
 
 
@@ -132,6 +142,7 @@ def browse_dataset(items, page_size=24, cols=6, width=128):
     btn_go = w.Button(description="Go", layout=w.Layout(width="40px"))
     btn_export = w.Button(description="Export Selection")
     btn_import = w.Button(description="Import Selection")
+    btn_clear = w.Button(description="Clear Selection")
     import_upload = w.FileUpload(accept='.json', multiple=False)
     download_link = w.HTML()
 
@@ -150,6 +161,48 @@ def browse_dataset(items, page_size=24, cols=6, width=128):
                 'key': key,
             }
         return item_cache[i]
+
+    def _resolve_stems_to_indices(stems):
+        wanted = []
+        seen = set()
+        for s in stems:
+            stem = str(s).strip()
+            if stem == '' or stem in seen:
+                continue
+            seen.add(stem)
+            wanted.append(stem)
+
+        if len(wanted) == 0:
+            return {}
+
+        out = {}
+        wanted_set = set(wanted)
+
+        ds = getattr(items, 'dataset', None)
+        arr = getattr(getattr(getattr(ds, 'fold', None), 'state', None), 'arr', None)
+        nreal = getattr(ds, '_nrealext', None)
+        retriever = getattr(ds, 'retriever', None)
+
+        if arr is not None and isinstance(nreal, int) and nreal > 0 and retriever is not None:
+            nsamples = len(arr) // nreal
+            for i in range(nsamples):
+                row = arr[i * nreal]
+                stem = retriever.hdrname(row)
+                if stem in wanted_set and stem not in out:
+                    out[stem] = i
+                    if len(out) == len(wanted_set):
+                        return out
+
+        # Fallback for non-iTar wrappers.
+        for i in range(n):
+            if len(out) == len(wanted_set):
+                break
+            it = _item(i)
+            stem = it['meta'].get('stem')
+            if stem is not None and stem in wanted_set and stem not in out:
+                out[stem] = i
+
+        return out
 
     def _all_visible_indices():
         if not only_selected.value:
@@ -292,25 +345,32 @@ def browse_dataset(items, page_size=24, cols=6, width=128):
         render(page_memory.get(mode, 1))
 
     def on_export(_):
-        ds = getattr(items, 'dataset', None)
-        fold_obj = getattr(ds, 'fold', None)
-        payload = {
-            'version': 1,
-            'dataset': getattr(ds, 'dataset', None),
-            'fold': getattr(fold_obj, 'fold', None),
-            'extensions': list(getattr(ds, 'extensions', [])) if ds is not None else None,
-            'selected': list(selected.values()),
-        }
-        content = json.dumps(payload, ensure_ascii=False, indent=2)
+        stems = []
+        missing_stem = 0
+        for rec in selected.values():
+            stem = rec.get('stem') if isinstance(rec, Mapping) else None
+            if stem is None or str(stem).strip() == '':
+                missing_stem += 1
+                continue
+            stems.append(str(stem))
+
+        # Deterministic output keeps exports diff-friendly and easy to merge.
+        content = json.dumps(sorted(set(stems)), ensure_ascii=False, indent=2)
         encoded = base64.b64encode(content.encode('utf8')).decode('ascii')
         download_link.value = (
             '<a download="selection.json" '
             f'href="data:application/json;base64,{encoded}">Download selection.json</a>'
         )
-        status.value = f'<i>Prepared export with {len(selected)} selected entries.</i>'
+        if missing_stem > 0:
+            status.value = (
+                f'<i>Prepared export with {len(stems)} stems '
+                f'({missing_stem} selected entries had no stem and were skipped).</i>'
+            )
+        else:
+            status.value = f'<i>Prepared export with {len(stems)} stems.</i>'
 
     def on_import(_):
-        raw = _extract_upload_bytes(import_upload.value)
+        raw = _extract_upload_bytes(import_upload)
         if raw is None:
             status.value = '<i>No JSON file uploaded.</i>'
             return
@@ -321,63 +381,52 @@ def browse_dataset(items, page_size=24, cols=6, width=128):
             status.value = f'<i>Import failed: invalid JSON ({exc}).</i>'
             return
 
-        if isinstance(parsed, dict):
-            records = parsed.get('selected', [])
-        elif isinstance(parsed, list):
-            records = parsed
-        else:
-            status.value = '<i>Import failed: JSON must be a list or an object with `selected`.</i>'
+        if not isinstance(parsed, list) or not all(isinstance(x, str) for x in parsed):
+            status.value = '<i>Import failed: JSON must be a list of stem strings.</i>'
             return
 
-        stem_to_index = {}
-        for i in range(n):
-            it = _item(i)
-            stem = it['meta'].get('stem')
-            if stem is not None and stem not in stem_to_index:
-                stem_to_index[stem] = i
+        stems = []
+        seen = set()
+        for stem in parsed:
+            k = stem.strip()
+            if k == '' or k in seen:
+                continue
+            seen.add(k)
+            stems.append(k)
+
+        if len(stems) == 0:
+            selected.clear()
+            _update_selection_count()
+            status.value = '<i>Imported 0 entries from empty stem list.</i>'
+            render(page)
+            return
+
+        status.value = '<i>Importing selection...</i>'
+        stem_to_index = _resolve_stems_to_indices(stems)
+
+        selected.clear()
 
         imported = 0
         skipped = 0
-        for rec in records:
-            stem = None
-            idx = None
-            extra = {}
-
-            if isinstance(rec, str):
-                stem = rec
-            elif isinstance(rec, Mapping):
-                stem = rec.get('stem')
-                idx = rec.get('idx')
-                extra = dict(rec)
-            else:
-                skipped += 1
-                continue
-
-            target_idx = None
-            if stem is not None:
-                target_idx = stem_to_index.get(stem)
-                if target_idx is None:
-                    skipped += 1
-                    continue
-            elif idx is not None:
-                idx = _coerce_int(idx, -1)
-                if 0 <= idx < n:
-                    target_idx = idx
-                else:
-                    skipped += 1
-                    continue
-            else:
+        for stem in stems:
+            target_idx = stem_to_index.get(stem)
+            if target_idx is None:
                 skipped += 1
                 continue
 
             it = _item(target_idx)
             key = it['key']
-            merged = _selection_entry(target_idx, it['label'], it['meta'])
-            merged.update({k: v for k, v in extra.items() if k not in {'stem', 'idx', 'fid', 'label'}})
-            selected[key] = merged
+            selected[key] = _selection_entry(target_idx, it['label'], it['meta'])
             imported += 1
 
         status.value = f'<i>Imported {imported} entries; skipped {skipped} missing/invalid entries.</i>'
+        render(page)
+
+    def on_clear_selection(_):
+        cleared = len(selected)
+        selected.clear()
+        _update_selection_count()
+        status.value = f'<i>Cleared {cleared} selected entries.</i>'
         render(page)
 
     btn_prev.on_click(on_prev)
@@ -385,6 +434,7 @@ def browse_dataset(items, page_size=24, cols=6, width=128):
     btn_go.on_click(on_go)
     btn_export.on_click(on_export)
     btn_import.on_click(on_import)
+    btn_clear.on_click(on_clear_selection)
     only_selected.observe(on_only_selected, names='value')
 
     # Initial draw
@@ -398,6 +448,6 @@ def browse_dataset(items, page_size=24, cols=6, width=128):
         selection_count,
         only_selected,
     ])
-    io_controls = w.HBox([btn_export, btn_import, import_upload, download_link])
+    io_controls = w.HBox([btn_export, btn_import, btn_clear, import_upload, download_link])
     display(w.VBox([controls, io_controls, status, out]))
 
