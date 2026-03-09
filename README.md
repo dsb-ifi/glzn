@@ -21,7 +21,12 @@ The name `glzn` is a textese disemvowelment of *glissen*, meaning sparse in Norw
 - `glzn.cfg`: config and argparse module to handle experiments with [pydantic](https://docs.pydantic.dev/latest/).
 - `glzn.proc`: training and validation processor for runs, providing optimization in a neatly packaged context manager.
 
-For `glzn.data` usage details (including grouping mode behavior and constraints), see `glzn/data/README.md`.
+Planned submodules:
+
+- `glzn.optim`: Commonly used optimizers for large scale image training.
+- `glzn.aug`: Augmentation factories for commonly used setups.
+- `glzn.parse`: Run factories for common supervised / self-supervised vision pipelines.
+
 
 `glzn` is designed to stay minimal and efficient for HPC resources, and minimalisim is what drives the development.
 
@@ -37,43 +42,64 @@ For `glzn.data` usage details (including grouping mode behavior and constraints)
 
 ## TODOs:
 
-- [ ] `data` submodule
+- [X] `data` submodule for data handling.
     - [X] iTar implementation.
     - [X] Basic grouping support.
     - [X] Stem search and extraction.
     - [X] Improved extension filtering.
     - [X] Low overhead stateful sampling capability.
-    - [ ] Add optional encoders.
-        - [ ] blosc2-openhtj2k.
-        - [ ] pillow-jxl-plugin.
-        - [ ] Additional video codecs.
-        - [ ] Seismic data support.
-    - [ ] Add encoder based grouping format.
-    - [ ] Collator factory with support for NamedTuple or dict from Dataloader.
-- [X] `cfg` submodule.
+    - [ ] Add-ons (low priority):
+        - [ ] Add optional encoders.
+            - [ ] blosc2-openhtj2k.
+            - [ ] pillow-jxl-plugin.
+            - [ ] Additional video codecs.
+            - [ ] Seismic data support.
+        - [ ] Add encoder based grouping format.
+        - [ ] Collator factory with support for NamedTuple or dict from Dataloader.
+- [ ] `aug` submodule for augmentations.
+    - [ ] Standard ViT Augmentations.
+    - [ ] DEIT3 Augmentations.
+    - [ ] DINO / iBOT Augmentations.
+        - [ ] DINOv2 / v3 support.
+    - [ ] MAE Augmentations.
+- [X] `cfg` submodule for config declaration.
     - [X] Pydantic type verification.
     - [X] Presedence logic.
-- [X] `parse` module, mostly LLRD support for now.
-- [ ] `log` module for rudimentary logging to jsonl and stdout.
+- [ ] `parse` module for modular approach to central config / run parsing.
+    - [ ] LLRD parsing support.
+    - [ ] Factories for creating runs for supervised training.
+        - [ ] IN1k training.
+        - [ ] IN22k training.
+        - [ ] COCO Segmentation training.
+        - [ ] COCO Detection / Instance Seg. training.
+    - [ ] Factories for creating runs for self-supervised training.
+        - [ ] DINO (no MIM)
+        - [ ] iBOT / DINOv2 / DINOv3
+        - [ ] MAE / MIMR (MIM Refiner)
+- [X] `log` module for rudimentary logging to jsonl and stdout.
     - [X] Basic logging support.
-    - [ ] Add Aim support.
-- [ ] `proc` submodule
+    - [ ] Add-ons (medium priority):
+        - [ ] Add Aim support.
+        - [ ] W&B support (low priority, locks users into pay-to-use)
+- [ ] `optim` module with commonly used optimizers not covered by PyTorch.
+    - [ ] cAdamW, StableAdamW, cStableAdamW.
+    - [ ] LAMB, cLAMB.
+    - [ ] Flags / registry for adaptive selection of gradient clipping (based on optimizer functionality).
+    - [ ] Add-ons (medium priority):
+        - [ ] Scion.
+- [X] `proc` submodule for train / validation processing and wrappers.
     - [X] Simple `ema` wrapper.
-    - [ ] Simple `sched` module.
+    - [X] Simple `sched` module.
+        - [X] Meta style precomputed array based schedulers.
         - [X] `wrap` module for wrapping scheduled events.
-        - [ ] Merge `sched` and `wrap` into one submodule.
-    - [ ] Basic `optim` module with commonly used optimizers.
-        - [ ] cAdamW, StableAdamW, cStableAdamW
-        - [ ] LAMB, cLAMB
     - [X] `step` module, tracks relevant training / validation phases.
         - [X] `StepState` class, for immutables.
         - [X] `StepTelemetry` class (clock for run start, etc.).
         - [X] `StepTracker` class for full experiment tracking.
-    - [ ] Main `proc` module for context-based batch processing.
-        - [ ] Gradient clipping support
-            - [ ] Add logic for adaptively selecting gradient clipping based on optimizer functionality.
-        - [ ] Gradient accumulation support, in conj. with `step`.
-        - [ ] AMP support / gradient scaling.
-        - [ ] Scheduling support through `wrap`.
-        - [ ] Simple logging via `log` + `step` modules.
-        - [ ] Context manager implementation.
+    - [X] Main `proc` module for context-based batch processing.
+        - [X] Gradient clipping support
+        - [X] Gradient accumulation support, in conj. with `step`.
+        - [X] AMP support / gradient scaling.
+        - [X] Scheduling support through `wrap`.
+        - [X] Simple logging via `log` + `step` modules.
+        - [X] Context manager implementation.
