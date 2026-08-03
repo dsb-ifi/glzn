@@ -16,7 +16,9 @@ def save_checkpoint(
     """Save a small named-state checkpoint.
 
     Values with ``state_dict()`` are stored by state dict. ``StepTracker`` is
-    stored through ``to_dict()``. Other values are stored directly.
+    stored through ``to_dict()`` after ``assert_checkpointable()`` so open
+    accumulation windows cannot be saved as exact resume points. Other values
+    are stored directly.
     """
 
     path = Path(path)
@@ -63,7 +65,10 @@ def load_checkpoint(
 
 def _pack_state(obj: Any) -> Any:
     if isinstance(obj, StepTracker):
+        # to_dict() enforces update-boundary / validation-only checkpoint policy.
         return {"kind": "step_tracker", "value": obj.to_dict()}
+    if hasattr(obj, "assert_checkpointable"):
+        obj.assert_checkpointable()
     if hasattr(obj, "state_dict"):
         return {"kind": "state_dict", "state_dict": obj.state_dict()}
     if hasattr(obj, "model_dump"):

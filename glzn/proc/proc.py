@@ -68,6 +68,8 @@ class _BatchContext:
     def __enter__(self) -> "_BatchContext":
         phase = self.phase or self.tracker.s.phase
         at = self.now if self.now is not None else time.time()
+        # switch_phase fails loud if leaving train with microstep != 0 so an
+        # open accumulation window is never silently discarded.
         self.tracker = self.tracker.switch_phase(phase, now=at)
         return self
 
@@ -205,17 +207,24 @@ class Processor:
         step_skipped = False
         last_lr: Optional[float] = None
         updated = tracker
-        log_tracker = updated
 
         if updated.s.is_train:
             with context():
                 self._backward(loss)
 
-            updated = updated.next_micro()
+            # ``is_update_step`` is defined on the pre-increment microstep:
+            # the microbatch about to be counted completes the open bucket when
+            # (microstep + 1) == bucket_size. Do not call ``next_micro`` before
+            # this check — that off-by-one collapses accumulation to every batch
+            # and can skip the tail flush when bucket_size == 1.
             if updated.s.is_update_step:
                 self._clip_gradients()
 
-                step_succeeded = self._optimizer_step(updated.s)
+                # Successful-update clock shared by LR/WD apply, EMA momentum,
+                # and update hooks: fullstep == number of successful updates
+                # already completed (0 on the first update).
+                state_at_update = updated.s
+                step_succeeded = self._optimizer_step(state_at_update)
                 step_skipped = not step_succeeded
 
                 now = time.time()
@@ -224,19 +233,23 @@ class Processor:
                 self.deps.optimizer.zero_grad(set_to_none=True)
 
                 if step_succeeded and self.scheduled_ema is not None:
-                    self.scheduled_ema.update_parameters(self.deps.model, updated.s)
+                    self.scheduled_ema.update_parameters(self.deps.model, state_at_update)
                 if step_succeeded:
                     for hook in self.deps.update_hooks:
-                        hook.on_update(model=self.deps.model, step_state=updated.s)
+                        hook.on_update(model=self.deps.model, step_state=state_at_update)
+            else:
+                updated = updated.next_micro()
 
-                if self.deps.optimizer.param_groups:
-                    last_lr = float(self.deps.optimizer.param_groups[0].get("lr", 0.0))
-        else:
-            step_skipped = False
-            if self.deps.optimizer.param_groups:
-                last_lr = float(self.deps.optimizer.param_groups[0].get("lr", 0.0))
+        # Always report the active group LR after the batch action. On
+        # non-update microbatches this is the LR last applied (or the
+        # optimizer default); schedules are only reapplied on update attempts.
+        if self.deps.optimizer.param_groups:
+            last_lr = float(self.deps.optimizer.param_groups[0].get("lr", 0.0))
 
         self._acc_skipped = (self._acc_skipped + int(step_skipped)) * int(step_skipped)
+        # Log the post-update / post-micro state for this batch, but before
+        # phase_iter advances so ``iteration`` is the 0-based index of the
+        # batch just processed.
         log_tracker = updated
         updated = updated.advance_iter()
 

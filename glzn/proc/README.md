@@ -157,10 +157,72 @@ The processor emits keys such as:
 
 ---
 
+## Update-boundary clock
+
+These fields share one successful-update clock:
+
+| Field / consumer | Meaning |
+|------------------|---------|
+| `microstep` | Microbatches finished in the open accumulation window (0 after each update attempt) |
+| `fullstep` | Number of **successful** optimizer updates completed so far |
+| `phase_iter` (`train_iter` / `val_iter`) | Batches finished in the current phase |
+| `is_update_step` | True when the **upcoming** microbatch completes the window: `(microstep + 1) == bucket_size` |
+| LR / WD schedules | Applied at update time with the pre-update `fullstep` |
+| EMA momentum + `update_hooks` | Receive the same pre-update `StepState` as the optimizer schedules |
+| AMP skip | Does **not** advance `fullstep`; still resets `microstep` and zeros grads |
+
+`bucket_size = min(accum_steps, phase_remaining + microstep)` so the open
+window does not shrink mid-accumulation, and a short final window still flushes.
+
+### Logging
+
+Each log row is emitted after the train action for that batch and **before**
+`phase_iter` advances:
+
+| Key | Meaning |
+|-----|---------|
+| `iteration` | 0-based index of the batch just processed |
+| `microstep` / `fullstep` | counters **after** the batch action |
+| schedule index (LR/WD/EMA/hooks) | pre-update `fullstep` (not logged directly) |
+| `last_lr` | active optimizer group LR after the batch (reapplied only on update attempts) |
+| `step_skipped` | true only when an update was attempted and the scaler rejected it |
+
+Example with `accum_steps=2`, `train_iters=3`:
+
+```text
+iter 0: microstep 1, fullstep 0, no update
+iter 1: microstep 0, fullstep 1, successful update
+iter 2: microstep 0, fullstep 2, successful tail update
+```
+
+### Phase transitions
+
+Leaving train (for validation or `next_epoch`) with `microstep != 0` **raises**.
+A completed training phase always flushes its final partial window, so a normal
+train → val handoff has `microstep == 0`. An open window means an interrupted
+iterator, early manual phase switch, or bad bookkeeping — not a silent discard.
+
+### Checkpoint resume
+
+`StepTracker` serializes counters (`microstep`, `fullstep`, iters, epoch, …).
+It does **not** serialize `.grad` accumulation buffers.
+
+**Exact resume is enforced at save time** via `StepTracker.assert_checkpointable()`
+(also invoked by `to_dict()` / `save_checkpoint`):
+
+- training: `microstep == 0` required (closed window after success **or** AMP skip)
+- validation: always allowed
+
+Saving mid-window fails with a clear `RuntimeError`. Do not add gradient
+serialization for mid-window resume.
+
+---
+
 ## Notes and Gotchas
 
 1. Always assign `tracker = b.updated_tracker` after each batch.
 2. `StepTracker.next_epoch(...)` is not implicit; call it at the end of every epoch.
 3. Validation batches still require a loss for logging/consistency in current implementation.
-4. With gradient accumulation, updates happen only when `StepState.is_update_step` is true.
+4. With gradient accumulation, updates happen only when `StepState.is_update_step` is true **before** counting the microbatch.
 5. `Processor.cancel_run` can be polled to stop if too many consecutive skipped updates occur.
+6. Mid-window checkpoints and mid-window phase exits are rejected; see **Checkpoint resume** and **Phase transitions**.

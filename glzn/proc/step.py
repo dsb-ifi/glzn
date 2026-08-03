@@ -38,6 +38,29 @@ class StepState:
             raise ValueError(f"train_iters_per_epoch must be >= 0, got {self.train_iters_per_epoch}")
         if self.val_iters_per_epoch < 0:
             raise ValueError(f"val_iters_per_epoch must be >= 0, got {self.val_iters_per_epoch}")
+        if self.epoch < 0:
+            raise ValueError(f"epoch must be >= 0, got {self.epoch}")
+        if self.train_iter < 0:
+            raise ValueError(f"train_iter must be >= 0, got {self.train_iter}")
+        if self.val_iter < 0:
+            raise ValueError(f"val_iter must be >= 0, got {self.val_iter}")
+        if self.microstep < 0:
+            raise ValueError(f"microstep must be >= 0, got {self.microstep}")
+        if self.fullstep < 0:
+            raise ValueError(f"fullstep must be >= 0, got {self.fullstep}")
+        if self.total_epochs < 0:
+            raise ValueError(f"total_epochs must be >= 0, got {self.total_epochs}")
+        # Open train windows keep microstep strictly inside the active bucket.
+        # Closed windows have microstep == 0. Validation never accumulates.
+        if self.is_train and self.microstep > 0 and self.microstep >= self.bucket_size:
+            raise ValueError(
+                f"microstep {self.microstep} is outside open accumulation window "
+                f"of size {self.bucket_size}."
+            )
+        if not self.is_train and self.microstep != 0:
+            raise ValueError(
+                f"validation phase requires microstep == 0, got {self.microstep}."
+            )
 
     @property
     def is_train(self) -> bool:
@@ -57,12 +80,33 @@ class StepState:
 
     @property
     def bucket_size(self) -> int:
+        """Accumulation window size for the currently open window.
+
+        The window is sized when it opens and must not shrink under an open
+        ``microstep`` counter. Horizon is the micros already finished in this
+        window plus the remaining phase iterations (including the upcoming
+        one): ``phase_remaining + microstep``. Then
+        ``bucket_size = min(accum_steps, horizon)``.
+        """
         if not self.is_train:
             return 1
-        return max(1, min(self.accum_steps, self.phase_remaining))
+        horizon = self.phase_remaining + self.microstep
+        if horizon <= 0:
+            return 1
+        return max(1, min(self.accum_steps, horizon))
 
     @property
     def is_update_step(self) -> bool:
+        """Whether the next train microbatch completes the open accum window.
+
+        ``microstep`` is the number of microbatches already finished in the
+        current window (0 at the start of a window). The upcoming microbatch
+        is the last in the window when ``microstep + 1 == bucket_size``.
+
+        ``Processor`` must evaluate this **before** ``next_micro()``. After a
+        successful or skipped optimizer update, ``on_update`` resets
+        ``microstep`` to 0. Non-update microbatches call ``next_micro()`` only.
+        """
         if not self.is_train:
             return False
         return (self.microstep + 1) == self.bucket_size
@@ -196,6 +240,13 @@ class StepTracker:
         s = self.s
         if s.phase is phase:
             return self
+        if s.is_train and s.microstep != 0:
+            raise RuntimeError(
+                "Cannot leave the training phase with an open accumulation window "
+                f"(microstep={s.microstep}). Finish or flush the remaining "
+                "microbatches so the final partial window updates, or restore a "
+                "checkpoint taken at an update boundary."
+            )
         if phase is Phase.TRAIN:
             s2 = replace(s, phase=Phase.TRAIN, microstep=0)
         else:
@@ -210,6 +261,13 @@ class StepTracker:
         return StepTracker(s=replace(s, microstep=s.microstep + 1), t=self.t)
 
     def on_update(self, *, step_succeeded: bool, now: float) -> "StepTracker":
+        """Close the current accumulation window after an optimizer attempt.
+
+        ``fullstep`` advances only when ``step_succeeded`` is true (successful
+        optimizer update). AMP overflow / scaler skip leaves ``fullstep``
+        unchanged but still resets ``microstep`` so the window does not remain
+        half-open. Call only when ``is_update_step`` is true.
+        """
         s = self.s
         if not s.is_train:
             return self
@@ -227,6 +285,11 @@ class StepTracker:
 
     def next_epoch(self, *, now: float) -> "StepTracker":
         s = self.s
+        if s.is_train and s.microstep != 0:
+            raise RuntimeError(
+                "Cannot advance epoch with an open accumulation window "
+                f"(microstep={s.microstep})."
+            )
         s2 = replace(
             s,
             epoch=s.epoch + 1,
@@ -238,7 +301,23 @@ class StepTracker:
         t2 = replace(self.t, epochstart=now, phasestart=now)
         return StepTracker(s=s2, t=t2)
 
+    def assert_checkpointable(self) -> None:
+        """Reject trackers that are not exact resume points.
+
+        Training may be checkpointed only with a closed accumulation window
+        (``microstep == 0``), including after an AMP-skipped update attempt.
+        Validation is always checkpointable. Gradients are never serialized.
+        """
+        if self.s.is_train and self.s.microstep != 0:
+            raise RuntimeError(
+                "Cannot checkpoint during an open accumulation window "
+                f"(phase=train, microstep={self.s.microstep}). "
+                "Exact resume is supported only at update boundaries "
+                "(microstep == 0) or during validation."
+            )
+
     def to_dict(self) -> Dict[str, Any]:
+        self.assert_checkpointable()
         return {"step": self.s.to_dict(), "telemetry": self.t.to_dict()}
 
     @staticmethod
