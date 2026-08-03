@@ -12,7 +12,7 @@ class ScheduledOptimizer:
 
     def __init__(
         self,
-        optimizer:Optimizer, 
+        optimizer:Optimizer,
         lr_scheduler:Scheduler|None=None,
         wd_scheduler:Scheduler|None=None,
         lr_group_schedulers:dict[str | int, Scheduler] | None=None,
@@ -28,7 +28,7 @@ class ScheduledOptimizer:
         self._lr_group_scales = [float(group.get('lr_scale', 1.0)) for group in optimizer.param_groups]
         self._wd_group_scales = [float(group.get('wd_scale', 1.0)) for group in optimizer.param_groups]
         self._group_names = [str(group.get('group_name', f'group_{i}')) for i, group in enumerate(optimizer.param_groups)]
-        
+
         # Check if schedulers are normalized, if not, normalize and reinitialize
         for (sch, name) in [(self.lr_scheduler, "LR"), (self.wd_scheduler, "WD")]:
              if sch is not None and not sch.normalize:
@@ -93,10 +93,16 @@ class ScheduledOptimizer:
 
 class ScheduledEMA:
 
-    def __init__(self, ema:EMA, momentum_scheduler:Scheduler|None=None):
+    def __init__(
+        self,
+        ema: EMA,
+        momentum_scheduler: Scheduler | None = None,
+        source: Callable | None = None,
+    ):
         self.ema = ema
         self._base_momentum = ema.decay
         self.momentum_scheduler = momentum_scheduler
+        self.source = source
         if self.momentum_scheduler is not None and not self.momentum_scheduler.normalize:
             warnings.warn("Unnormalized momentum scheduler detected. Normalizing and reinitializing schedule.")
             self.momentum_scheduler.normalize = True
@@ -105,7 +111,8 @@ class ScheduledEMA:
     def update_parameters(self, model, step_state:StepState):
         if self.momentum_scheduler is not None:
             self.ema.decay = self.momentum_scheduler(step_state) * self._base_momentum
-        self.ema.update_parameters(model)
+        source = model if self.source is None else self.source(model)
+        self.ema.update_parameters(source)
 
 
 class ScheduledLoss:
@@ -123,8 +130,8 @@ class ScheduledLoss:
             loss_weight = self.loss_scheduler(step_state)
         else:
             loss_weight = 1.0
-        
+
         def weighted_loss_fn(*args, **kwargs):
             return self.loss_fn(*args, **kwargs) * loss_weight
-        
+
         return weighted_loss_fn

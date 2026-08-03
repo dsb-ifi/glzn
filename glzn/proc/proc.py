@@ -3,7 +3,7 @@ from __future__ import annotations
 import time
 from contextlib import nullcontext
 from dataclasses import dataclass
-from typing import Any, Callable, ContextManager, NamedTuple, Optional, Sequence
+from typing import Any, Callable, ContextManager, NamedTuple, Optional, Protocol, Sequence
 
 import torch
 import torch.nn as nn
@@ -21,6 +21,17 @@ from .wrap import ScheduledEMA, ScheduledOptimizer
 
 TensorSequence = Tensor | Sequence[Tensor]
 CallableContext = Callable[[], ContextManager[Any]]
+EMASource = Callable[[nn.Module], nn.Module]
+
+
+class UpdateHook(Protocol):
+    def on_update(
+        self,
+        *,
+        model: nn.Module,
+        step_state: StepState,
+    ) -> None:
+        ...
 
 
 class ProcDeps(NamedTuple):
@@ -33,6 +44,8 @@ class ProcDeps(NamedTuple):
     scaler: GradScaler | None = None
     ema: EMA | None = None
     ema_scheduler: Scheduler | None = None
+    ema_source: EMASource | None = None
+    update_hooks: Sequence[UpdateHook] = ()
 
 
 @dataclass
@@ -98,8 +111,9 @@ class Processor:
         self.scheduled_ema = (
             None if deps.ema is None
             else ScheduledEMA(
-                ema=deps.ema, 
-                momentum_scheduler=deps.ema_scheduler
+                ema=deps.ema,
+                momentum_scheduler=deps.ema_scheduler,
+                source=deps.ema_source,
             )
         )
 
@@ -211,6 +225,9 @@ class Processor:
 
                 if step_succeeded and self.scheduled_ema is not None:
                     self.scheduled_ema.update_parameters(self.deps.model, updated.s)
+                if step_succeeded:
+                    for hook in self.deps.update_hooks:
+                        hook.on_update(model=self.deps.model, step_state=updated.s)
 
                 if self.deps.optimizer.param_groups:
                     last_lr = float(self.deps.optimizer.param_groups[0].get("lr", 0.0))
@@ -256,6 +273,5 @@ class Processor:
             now=now,
             logging_kwargs=logging_kwargs,
         )
-
 
 

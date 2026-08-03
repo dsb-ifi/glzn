@@ -1,0 +1,32 @@
+[project]
+name = "glzn"
+version = "0.1.0"
+description = "Small training, configuration, logging, and iTar data utilities."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "ipython",
+    "ipywidgets",
+    "numpy",
+    "numpydoc",
+    "packaging",
+    "pillow",
+    "pydantic",
+    "pydantic-settings",
+    "pyyaml",
+    "scipy",
+    "toml",
+    "torch",
+    "torchvision",
+    "xxhash",
+]
+
+[dependency-groups]
+dev = [
+    "pyright",
+]
+
+[tool.pyright]
+include = ["glzn", "tests"]
+pythonVersion = "3.12"
+typeCheckingMode = "standard"

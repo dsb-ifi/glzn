@@ -155,8 +155,12 @@ cython_debug/
 # .vscode specifics
 .vscode/
 
-# Drop trash
+# Drop trash and temporary files
 .trash/
+.tmp/
 
 # Drop notebooks
 *.ipynb
+
+# Drop tests (until the suite is more complete)
+tests/
