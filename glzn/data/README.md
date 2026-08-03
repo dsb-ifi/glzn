@@ -109,13 +109,49 @@ This is useful for multipair datasets, such as video frame data, or multipose da
 Rules:
 - grouping is activated only via `add_grouping(...)`;
 - pseudoextensions are not supported in grouping mode;
-- filtering (`filter_extensions`, `filter_stems`, `filter_stems_by_json`) is disallowed after grouping;
-- mapping transforms are disallowed before grouping and validated against grouped output arity once grouping is active;
+- schema-changing filtering (`filter_extensions`) is disallowed after grouping;
+- transforms (`map`, `map_all`, `map_group`, `map_tuple`) work in ordinary and grouped modes;
+- once transforms are attached, schema-changing operations such as `add_grouping` and `filter_extensions` are disallowed;
 - grouping does not change dataset cardinality (`__len__`);
 - grouping templates are positional (for example `{0}`, `{1}`) and must use contiguous slot indices from `0`;
 - grouping currently requires symmetric slot requirements (all slots must require the same suffix set);
 - grouped sampling is deterministic per dataset state, epoch, and sampled index;
 - `grouping_seed` can be supplied to `add_grouping(..., grouping_seed=...)` to override internal grouped sampling seed.
+
+Repeated logical extensions are supported. For example,
+`extensions=['jpg', 'jpg', 'jpg', 'cls']` retrieves and decodes the stored
+`jpg` member once, then exposes the same decoded Python object at the three
+logical image positions before transforms run. Transforms for repeated
+positions should therefore be functional and must not mutate their inputs
+in place.
+
+Sampling remains fused into `iTarDataset`: the internal physical-storage-aware
+permutation defines a global logical order, and optional distributed rank
+partitioning consumes that order by rank-striding:
+
+```text
+local index ℓ  →  global position g = rank + ℓ * world_size
+               →  physical index p = sampler[g]
+```
+
+`set_epoch(epoch)` is the epoch-boundary resume primitive; exact mid-epoch
+cursor resume is intentionally not part of the dataset API. Do not call
+`set_epoch` while a DataLoader iterator is active (workers can mix epochs
+within one pass).
+
+Dataset checkpoint state (`state_dict` / `load_state_dict`) is portable
+across ranks and process topologies. It restores epoch, seeds, and shuffle
+configuration only. Distributed topology is configured separately through
+`set_distributed()` and is not overwritten by `load_state_dict()` (legacy
+topology keys in older state dicts are ignored).
+
+Stem filtering remains allowed after grouping and after transforms because
+it does not change output schema; `filter_extensions` and `add_grouping`
+remain schema-changing.
+
+Transform pipeline outputs must be a list or tuple of logical fields.
+Bare strings, dicts, and other non-sequence scalars are rejected rather
+than being expanded element-wise.
 
 Example of an invalid asymmetric template (fails fast):
 

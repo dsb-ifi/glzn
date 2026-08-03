@@ -4,13 +4,12 @@ from typing import Sequence
 
 # TODO: Add fuzzy testing, random N, random rounds, random seed.
 
-np.seterr(over='ignore')
-
 _MULT = np.uint64(0x9E3779B97F4A7C15)
 
 def __F(x:np.uint64, k:np.uint64, mask:np.uint64) -> np.uint64:
     # Fast bijective mixing on half-words natively in 64-bit
-    return (x * _MULT + k) & mask
+    with np.errstate(over='ignore'):
+        return (x * _MULT + k) & mask
 
 def feistel(i:int, N:int, half:int, mask:int, keys:np.ndarray) -> int:
     '''Feistel permutation for a single integer.

@@ -54,7 +54,7 @@ def _rows_contiguous(arr: np.ndarray, n_stems: int) -> bool:
     nruns = int(diff.sum()) + 1
     return nruns == n_stems
 
-def _scan(buf:bytes|mmap.mmap, fid:int, st:"iTarState") -> "iTarState":
+def _scan(buf:bytes|bytearray|mmap.mmap, fid:int, st:"iTarState") -> "iTarState":
     """
     Scans a tar file buffer and updates the iTarState with offset records.
 
@@ -78,7 +78,7 @@ def _scan(buf:bytes|mmap.mmap, fid:int, st:"iTarState") -> "iTarState":
         if len(hdr) < _BLK or hdr == b'\0' * _BLK:
             break
         size = int(hdr[124:136].split(b'\0', 1)[0] or b'0', 8)
-        fn = StemHelper.from_hdr(hdr)
+        fn = StemHelper.from_hdr(bytes(hdr))
         stem, ext = fn.stem, fn.suffix_no_dot
         key = xxhash.xxh64(stem.encode()).intdigest()
         extid = st.ext2id.setdefault(ext, len(st.ext2id))
@@ -339,5 +339,3 @@ def parse_tar(
                 data.extend(chunk)
             st = _scan(data, fid, st)
     return st
-
-

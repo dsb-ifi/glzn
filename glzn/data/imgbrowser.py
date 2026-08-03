@@ -280,7 +280,7 @@ def browse_dataset(items, page_size=24, cols=6, width=128):
 
                 toggle.observe(_on_toggle, names='value')
 
-                card_children = [img_widget]
+                card_children:list[w.Widget] = [img_widget]
                 if label is not None:
                     card_children.append(w.HTML(str(label)))
                 card_children.append(toggle)
@@ -450,4 +450,3 @@ def browse_dataset(items, page_size=24, cols=6, width=128):
     ])
     io_controls = w.HBox([btn_export, btn_import, btn_clear, import_upload, download_link])
     display(w.VBox([controls, io_controls, status, out]))
-

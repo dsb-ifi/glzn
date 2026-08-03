@@ -1,19 +1,22 @@
 from __future__ import annotations
-import string, torchvision, pkg_resources, json, functools, inspect, xxhash, numpy as np
+import multiprocessing as mp
+import string, torchvision, json, functools, inspect, xxhash, numpy as np
 from contextlib import contextmanager
 from torch.utils.data import Dataset
 from pathlib import Path
 from os import PathLike
+from collections.abc import Mapping as ABCMapping
 from typing import Any, Callable, Sequence, Mapping
+from packaging.version import parse as parse_version
 
 from .encoders import DEFAULT_DECODERS, PseudoExtension, PIL
-from .maptrafo import MapAll, MapGrouped, MapTuple, DefaultIdentity
+from .maptrafo import Map, MapAll, MapGrouped, MapTuple, DefaultIdentity
 from .sampler import IdentitySampler, MultiFeistelSampler
 from .imgbrowser import browse_dataset
 from .itar.fold import iTarFold, iTarRetriever
 from .itar.utils import StemHelper, stripext
 
-USE_TV_TENSOR = pkg_resources.parse_version(torchvision.__version__) >= pkg_resources.parse_version('0.16')
+USE_TV_TENSOR = parse_version(torchvision.__version__) >= parse_version('0.16')
 _valid_pseudo_extensions = PseudoExtension._valid_pseudo_extensions
 
 
@@ -26,6 +29,29 @@ def _compose(fs):
             return g(f(x))
         return c2
     return functools.reduce(c, fs, DefaultIdentity())
+
+
+def _finalize_sample(result:Any) -> tuple:
+    '''Normalize transform-pipeline output to a sample field tuple.
+
+    Public contract: the pipeline must yield a list or tuple of logical
+    output fields. Strings, mappings, and bare scalars are rejected so they
+    are never silently expanded by ``tuple(...)``.
+    '''
+    if isinstance(result, tuple):
+        return result
+    if isinstance(result, list):
+        return tuple(result)
+    if isinstance(result, (str, bytes, bytearray)) or isinstance(result, ABCMapping):
+        raise TypeError(
+            'Transform pipeline must return a list or tuple of sample fields; '
+            f'got {type(result).__name__}.'
+        )
+    raise TypeError(
+        'Transform pipeline must return a list or tuple of sample fields; '
+        f'got {type(result).__name__}. Wrap a single field as a one-element '
+        'tuple or list, e.g. ``(value,)``.'
+    )
 
 
 def _parse_decoders(
@@ -153,9 +179,16 @@ class iTarDataset(Dataset):
 
         # Init sampling details
         self._epoch = 0
+        self._shared_epoch = mp.Value('q', 0)
         self._seed = internal_seed
         self._grouping_seed = internal_seed ^ 0xBAD5EED
         self.buckets_per_shard = max(1, buckets_per_shard)
+        self._distributed_rank = 0
+        self._distributed_world_size = 1
+        self._distributed_drop_last = False
+        self._shuffle_enabled = False
+        self._shuffle_shard_mixing = False
+        self._shuffle_rounds = 3
         self._update_fold_state_vars()
 
         # Grouping is an explicit opt-in mode initialized via add_grouping().
@@ -166,16 +199,18 @@ class iTarDataset(Dataset):
         self._grouping_active = False
 
     def __len__(self):
-        return len(self.fold.state.arr) // self._nrealext
+        self._sync_epoch_from_shared()
+        return self._distributed_len(self._global_len())
 
     def __getitem__(self, idx:int) -> tuple:
+        self._sync_epoch_from_shared()
         if idx < 0:
             idx = len(self) + idx
         if idx < 0 or idx >= len(self):
             raise IndexError(
                 f'iTarDataset index out of range, {idx} not in [0, {len(self)}).'
             )
-        idx = self._sampler[idx]
+        idx = self._sampler[self._local_to_global_index(idx)]
 
         if self._grouping_active:
             return self._getitem_grouped(idx)
@@ -204,7 +239,7 @@ class iTarDataset(Dataset):
                 case '_fid':
                     out[ext] = int(fid) if fid is not None else None
 
-        return tuple(self._trafo([out[e] for e in self.extensions]))
+        return _finalize_sample(self._trafo([out[e] for e in self.extensions]))
 
     def _getitem_grouped(self, idx:int) -> tuple:
         n = self._nrealext
@@ -220,7 +255,7 @@ class iTarDataset(Dataset):
                 continue
             out[ext] = self.decoders[extid](bytes(self.retriever.from_row(row)))
 
-        return tuple(self._trafo([out[e] for e in extensions]))
+        return _finalize_sample(self._trafo([out[e] for e in extensions]))
 
     @staticmethod
     def supports_tv_tensor() -> bool:
@@ -242,21 +277,22 @@ class iTarDataset(Dataset):
             raise ValueError('At least one real extension must be provided!')
         self._extmap = {v: k for k, v in self.fold.state.ext2id.items()}
         self.decoders = _parse_decoders(self.fold)
+        self._validate_contiguous_row_groups('_sync_extension_state()')
 
     def _refresh_bucketsize(self):
         computed_size = round(sum(self.shard_bincount) / (len(self.shard_bincount) * self.buckets_per_shard))
         self._bucket_size = max(1, int(computed_size))
 
     def _update_fold_state_vars(self):
-        bincount = self.fold.bincount
+        bincount = self._sample_bincount()
         if bincount.sum() <= 0:
             raise ValueError(
                 'Fold state has no samples! ' 
                 'This is either due to erroneous filtering or an empty dataset.'
-            )
+        )
         self.shard_bincount = bincount
-        self._sampler = IdentitySampler(len(self))
         self._refresh_bucketsize()
+        self._rebuild_sampler()
 
     def _assert_grouping_inactive(self, caller:str):
         if self._grouping_active:
@@ -265,17 +301,145 @@ class iTarDataset(Dataset):
                 f'Configure all filters before enabling grouping.'
             )
 
-    def _assert_grouping_active_for_map(self, caller:str):
-        if not self._grouping_active:
+    def _assert_schema_mutable(self, caller:str):
+        if self.transforms:
             raise RuntimeError(
-                f'{caller} requires active grouping mode. '
-                f'Call add_grouping(...) before adding transforms.'
+                f'{caller} cannot change dataset output schema after transforms '
+                'have been attached.'
             )
 
     def _expected_output_arity(self) -> int:
         if self._grouping_active and self.grouping is not None:
             return len(self.grouping)
         return len(self.extensions)
+
+    def _validate_transform_indices(self, indices:Sequence[int], caller:str) -> tuple[int,...]:
+        clean = tuple(indices)
+        arity = self._expected_output_arity()
+        if len(clean) == 0:
+            raise ValueError(f'{caller} requires at least one index.')
+        for i in clean:
+            if i < 0 or i >= arity:
+                raise IndexError(
+                    f'{caller} index {i} is out of range for output arity {arity}.'
+                )
+        return clean
+
+    def _global_len(self) -> int:
+        return len(self.fold.state.arr) // self._nrealext
+
+    def _distributed_len(self, global_len:int) -> int:
+        world_size = self._distributed_world_size
+        rank = self._distributed_rank
+        if self._distributed_drop_last:
+            return global_len // world_size
+        if rank >= global_len:
+            return 0
+        return (global_len - rank + world_size - 1) // world_size
+
+    def _local_to_global_index(self, idx:int) -> int:
+        global_idx = self._distributed_rank + idx * self._distributed_world_size
+        if self._distributed_drop_last:
+            usable = (self._global_len() // self._distributed_world_size) * self._distributed_world_size
+            if global_idx >= usable:
+                raise IndexError(f'Distributed index {idx} maps outside drop_last range.')
+        return global_idx
+
+    def _sample_bincount(self) -> np.ndarray:
+        arr = self.fold.state.arr
+        if len(arr) % self._nrealext != 0:
+            raise ValueError(
+                f'Fold row count {len(arr)} is not divisible by '
+                f'{self._nrealext} real extensions.'
+            )
+        sample_fids = arr[::self._nrealext]['fid']
+        return np.bincount(sample_fids)
+
+    def _sampler_sizes(self, shard_mixing:bool|None=None) -> list[int]:
+        shard_mixing = self._shuffle_shard_mixing if shard_mixing is None else shard_mixing
+        Ns:list[int] = self.shard_bincount.tolist()
+        if shard_mixing:
+            if not self.fold.state.is_contiguous:
+                raise ValueError(
+                    'Shard mixing requires contiguous fold state! '
+                    'Reinitialize dataset with `enforce_contiguous=True`.'
+                )
+            N = self._bucket_size
+            num_Ns = self._global_len() // N
+            last_N = self._global_len() % N
+            Ns = [N] * num_Ns + ([last_N] if last_N > 0 else [])
+        return Ns
+
+    def _rebuild_sampler(self):
+        if self._shuffle_enabled:
+            self._sampler = MultiFeistelSampler(
+                self._sampler_sizes(),
+                self._shuffle_rounds,
+                self._seed + self._epoch,
+            )
+        else:
+            self._sampler = IdentitySampler(self._global_len())
+
+    def _sync_epoch_from_shared(self):
+        epoch_value = int(self._shared_epoch.value)
+        if epoch_value != self._epoch:
+            self._epoch = epoch_value
+            self._rebuild_sampler()
+
+    def _set_epoch_local_and_shared(self, epoch:int):
+        if epoch < 0:
+            raise ValueError(f'epoch must be non-negative, got {epoch}.')
+        self._epoch = int(epoch)
+        self._shared_epoch.value = int(epoch)
+        self._rebuild_sampler()
+
+    def _stem_label(self, row) -> str:
+        crashid = int(row['crashid'])
+        if crashid != 0:
+            for stem, cid in self.fold.state.crashstem.items():
+                if cid == crashid:
+                    return stem
+        return self.fold.state.hashinfo.get(int(row['keyhash']), str(int(row['keyhash'])))
+
+    def _validate_contiguous_row_groups(self, caller:str) -> None:
+        arr = self.fold.state.arr
+        n = self._nrealext
+        if len(arr) % n != 0:
+            raise ValueError(
+                f'{caller}: fold row count {len(arr)} is not divisible by '
+                f'{n} requested real extensions.'
+            )
+        expected_ids = {
+            self.fold.state.ext2id[e]
+            for e in self._real_ext
+            if e in self.fold.state.ext2id
+        }
+        if len(expected_ids) != n:
+            raise ValueError(
+                f'{caller}: expected {n} unique real extensions, got '
+                f'{len(expected_ids)} from {sorted(self._real_ext)}.'
+            )
+        expected_ext = sorted(self._real_ext)
+        for start in range(0, len(arr), n):
+            rows = arr[start:start+n]
+            keys = {(int(r['keyhash']), int(r['crashid'])) for r in rows}
+            if len(keys) != 1:
+                stems = [self._stem_label(r) for r in rows]
+                raise ValueError(
+                    f'{caller}: row group starting at row {start} mixes stems '
+                    f'{stems}; expected one contiguous stem block.'
+                )
+            observed_ids = [int(r['extid']) for r in rows]
+            if set(observed_ids) != expected_ids or len(observed_ids) != len(set(observed_ids)):
+                observed = [
+                    self._extmap.get(int(extid), f'<unknown:{int(extid)}>')
+                    for extid in observed_ids
+                ]
+                raise ValueError(
+                    f'{caller}: row group starting at row {start} for stem '
+                    f'{self._stem_label(rows[0])} has extensions {observed}; '
+                    f'expected exactly once each: {expected_ext}.'
+                )
 
     def _infer_grouping(self, seq_str:tuple[str,...]|None) -> int:
         if seq_str is None:
@@ -425,6 +589,7 @@ class iTarDataset(Dataset):
         Grouped sampling is deterministic per dataset state, epoch, and sampled
         index.
         '''
+        self._assert_schema_mutable('add_grouping()')
         group = tuple(grouping)
         group_slots = self._infer_grouping(group)
         prefixes = self._check_grouping_validity(group, group_slots, grouping_replace)
@@ -466,6 +631,7 @@ class iTarDataset(Dataset):
         iTarDataset
             Updated dataset with filtered extensions.
         '''
+        self._assert_schema_mutable('filter_extensions()')
         self._assert_grouping_inactive('filter_extensions()')
         clean = [stripext(e) for e in extensions]
         self.fold.filter_extensions(clean)
@@ -486,9 +652,17 @@ class iTarDataset(Dataset):
         -------
         iTarDataset
             Updated dataset with filtered stems.
+
+        Notes
+        -----
+        Stem filtering is schema-neutral: it does not change output field count,
+        order, or meaning. It remains allowed after transforms and after
+        ``add_grouping()``. Extension filtering and adding grouping remain
+        schema-changing and are blocked once transforms are attached (and
+        extension filtering stays blocked after grouping).
         '''
-        self._assert_grouping_inactive('filter_stems()')
         self.fold.filter_stems(stems)
+        self._validate_contiguous_row_groups('filter_stems()')
         self._update_fold_state_vars()
         return self
 
@@ -630,7 +804,11 @@ class iTarDataset(Dataset):
         '''Takes a mapping and applies it to the tuple of extensions.
 
         For `mapping = f` and `extensions = ['jpg', 'cls'], this will return
-        the tuple `f(<sample>.jpg, <sample>.cls)`.
+        the fields produced by ``f(<sample>.jpg, <sample>.cls)``.
+
+        The mapping must return a ``list`` or ``tuple`` of logical output
+        fields. Strings, dicts, and bare scalars are rejected (they are not
+        silently expanded element-wise).
 
         Parameters
         ----------
@@ -642,7 +820,6 @@ class iTarDataset(Dataset):
         iTarDataset
             Updated dataset with added transformations.
         '''
-        self._assert_grouping_active_for_map('map()')
         if not callable(mapping):
             raise TypeError("Provided mapping is not callable.")
 
@@ -660,7 +837,7 @@ class iTarDataset(Dataset):
                 f"Mapping function for map() must accept {n_expected} positional arguments, "
                 f"but got {n_actual}."
             )
-        return self._add_trafo(mapping)
+        return self._add_trafo(Map(mapping))
 
     def map_all(self, mapping:Callable) -> "iTarDataset":
         '''Takes a mapping and applies it to all extensions.
@@ -678,7 +855,6 @@ class iTarDataset(Dataset):
         iTarDataset
             Updated dataset with added transformations.
         '''
-        self._assert_grouping_active_for_map('map_all()')
         if not callable(mapping):
             raise TypeError("Provided mapping is not callable.")
         return self._add_trafo(MapAll(mapping))
@@ -701,12 +877,11 @@ class iTarDataset(Dataset):
         iTarDataset
             Updated dataset with added transformations.
         '''
-        self._assert_grouping_active_for_map('map_group()')
         if not callable(mapping):
             raise TypeError("Provided mapping is not callable.")
-        return self._add_trafo(MapGrouped(mapping, indices))
+        return self._add_trafo(MapGrouped(mapping, self._validate_transform_indices(indices, 'map_group()')))
 
-    def map_tuple(self, *maps:Sequence[Callable]) -> "iTarDataset":
+    def map_tuple(self, *maps:Callable) -> "iTarDataset":
         """Applies given mappings to individual extensions of dataset items.
 
         For `maps = [f1, f2]` and `extensions = ['jpg', 'cls']`, this will return
@@ -734,7 +909,6 @@ class iTarDataset(Dataset):
         iTarDataset
             Updated dataset with added transformations.
         """
-        self._assert_grouping_active_for_map('map_tuple()')
         if not all(callable(m) for m in maps):
             raise TypeError("One or more mapping is not callable.")
         num_ext = self._expected_output_arity()
@@ -744,6 +918,102 @@ class iTarDataset(Dataset):
                 f"Expected {num_ext}, got {len(maps)}."
             )
         return self._add_trafo(MapTuple(maps))
+
+    def set_distributed(
+        self,
+        rank:int,
+        world_size:int,
+        drop_last:bool=False,
+    ) -> "iTarDataset":
+        """Configure fused rank partitioning after global permutation.
+
+        The dataset first builds one global physical-storage-aware ordering,
+        then rank ``r`` consumes positions ``r, r + world_size, ...`` from that
+        ordering. This preserves the iTar-locality sampler while making rank
+        partitioning explicit and deterministic.
+        """
+        if world_size < 1:
+            raise ValueError(f'world_size must be positive, got {world_size}.')
+        if rank < 0 or rank >= world_size:
+            raise ValueError(
+                f'rank must be in [0, {world_size}), got {rank}.'
+            )
+        self._distributed_rank = int(rank)
+        self._distributed_world_size = int(world_size)
+        self._distributed_drop_last = bool(drop_last)
+        return self
+
+    def set_epoch(self, epoch:int) -> "iTarDataset":
+        """Set epoch-boundary sampling state.
+
+        This is an epoch-boundary resume primitive, not a mid-epoch cursor.
+        Worker copies created by a DataLoader observe changes through shared
+        epoch state on the next ``__getitem__`` or ``__len__`` call.
+
+        Do not call ``set_epoch`` while a DataLoader iterator over this dataset
+        is active: workers refresh on the next sample, so a single pass can
+        mix two epochs. Finish the iterator (or drop it), then set the epoch
+        before constructing the next iterator.
+        """
+        self._set_epoch_local_and_shared(epoch)
+        return self
+
+    def set_shuffle(
+        self,
+        enabled:bool=True,
+        *,
+        shard_mixing:bool=False,
+        rounds:int=3,
+    ) -> "iTarDataset":
+        """Enable or disable the internal physical-storage-aware permutation."""
+        if rounds < 1:
+            raise ValueError(f'rounds must be positive, got {rounds}.')
+        self._shuffle_enabled = bool(enabled)
+        self._shuffle_shard_mixing = bool(shard_mixing)
+        self._shuffle_rounds = int(rounds)
+        self._rebuild_sampler()
+        return self
+
+    def state_dict(self) -> dict[str, Any]:
+        """Return portable epoch-boundary sampling state.
+
+        Dataset checkpoint state is portable across ranks and process
+        topologies. It includes deterministic logical sampling configuration
+        only (epoch, seeds, shuffle, bucket sizing). Distributed topology
+        (``rank``, ``world_size``, ``drop_last``) is runtime process state
+        owned by ``set_distributed()`` and is not included.
+        """
+        return {
+            'epoch': self._epoch,
+            'seed': self._seed,
+            'grouping_seed': self._grouping_seed,
+            'shuffle_enabled': self._shuffle_enabled,
+            'shuffle_shard_mixing': self._shuffle_shard_mixing,
+            'shuffle_rounds': self._shuffle_rounds,
+            'buckets_per_shard': self.buckets_per_shard,
+        }
+
+    def load_state_dict(self, state:Mapping[str, Any]) -> "iTarDataset":
+        """Restore portable epoch-boundary sampling state.
+
+        Restores logical sampling configuration (epoch, seeds, shuffle,
+        buckets). Live runtime handles such as the shared epoch cell,
+        retrievers, and memory maps are not serialized.
+
+        Distributed topology is configured separately through
+        ``set_distributed()`` and is never overwritten here. Legacy state
+        dictionaries that still contain ``rank`` / ``world_size`` /
+        ``drop_last`` keys are accepted but those keys are ignored.
+        """
+        self._seed = int(state.get('seed', self._seed))
+        self._grouping_seed = int(state.get('grouping_seed', self._grouping_seed))
+        self.buckets_per_shard = int(state.get('buckets_per_shard', self.buckets_per_shard))
+        self._shuffle_enabled = bool(state.get('shuffle_enabled', self._shuffle_enabled))
+        self._shuffle_shard_mixing = bool(state.get('shuffle_shard_mixing', self._shuffle_shard_mixing))
+        self._shuffle_rounds = int(state.get('shuffle_rounds', self._shuffle_rounds))
+        self._refresh_bucketsize()
+        self._set_epoch_local_and_shared(int(state.get('epoch', self._epoch)))
+        return self
     
     def browse(
         self, img_ext:str='jpg', lab_ext:str='cls', 
@@ -779,22 +1049,20 @@ class iTarDataset(Dataset):
         self, seed:int|None=None, shard_mixing:bool=False, rounds:int=3
     ):
         seed = self._seed + self._epoch if seed is None else seed
-        Ns:list[int] = self.fold.bincount.tolist()
-        if shard_mixing: 
-            if not self.fold.state.is_contiguous:
-                raise ValueError(
-                    'Shard mixing requires contiguous fold state! ' 
-                    'Reinitialize dataset with `enforce_contiguous=True`.'
-                )
-            N = self._bucket_size
-            num_Ns = len(self) // N
-            last_N = len(self) % N
-            Ns = [N] * num_Ns + ([last_N] if last_N > 0 else [])
-        
+        old = (
+            self._shuffle_enabled,
+            self._shuffle_shard_mixing,
+            self._shuffle_rounds,
+            self._sampler,
+        )
         try:
-            self._sampler = MultiFeistelSampler(Ns, rounds, seed)
+            self._sampler = MultiFeistelSampler(self._sampler_sizes(shard_mixing), rounds, seed)
             yield
         finally:
-            self._sampler = IdentitySampler(len(self))
-            self._epoch += 1
-
+            (
+                self._shuffle_enabled,
+                self._shuffle_shard_mixing,
+                self._shuffle_rounds,
+                self._sampler,
+            ) = old
+            self.set_epoch(self._epoch + 1)
