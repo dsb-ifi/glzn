@@ -4,7 +4,7 @@ from __future__ import annotations
 import math
 import re
 from types import MappingProxyType
-from typing import Any, Literal, Mapping
+from typing import Any, Literal, Mapping, cast
 
 from pydantic import (
     BaseModel,
@@ -88,8 +88,9 @@ def normalize_scalar(value: Any, *, allow_str: bool, allow_none: bool, field: st
         )
 
     if _is_numpy_scalar(value):
+        # cast: pyright can mis-narrow np.generic after the Python bool branch
         return normalize_scalar(
-            value.item(),
+            cast(Any, value).item(),
             allow_str=allow_str,
             allow_none=allow_none,
             field=field,
@@ -119,7 +120,7 @@ def classify_nonfinite(value: float) -> NonFiniteKind:
 def normalize_dims(dims: Mapping[str, Any] | None) -> dict[str, DimensionScalar]:
     """Task dims → plain Python scalars (non-finite rejected).
 
-    Metric/dim *names* are validated on ``LogRecordV1`` construction, not here.
+    Metric/dim *names* are validated on ``LogRecord`` construction, not here.
     """
     raw = {} if dims is None else dict(dims)
     out: dict[str, DimensionScalar] = {}
@@ -145,7 +146,7 @@ def normalize_metrics(
 
     Coerces scalar torch/NumPy values, splits non-finite floats into
     ``None`` + sidecar, and delegates remaining type checks to
-    ``normalize_scalar``. Metric *names* are validated on ``LogRecordV1``.
+    ``normalize_scalar``. Metric *names* are validated on ``LogRecord``.
     """
     raw = {} if metrics is None else dict(metrics)
     out: dict[str, MetricScalar] = {}
@@ -172,7 +173,7 @@ def normalize_metrics(
     return out, nonfinite
 
 
-class LogRecordV1(BaseModel):
+class LogRecord(BaseModel):
     """Frozen schema-v1 update record (Pydantic v2 validation boundary).
 
     Pydantic is an implementation and validation mechanism. The serialized
@@ -271,7 +272,7 @@ class LogRecordV1(BaseModel):
         return dict(v)
 
     @model_validator(mode="after")
-    def _cross_field(self) -> "LogRecordV1":
+    def _cross_field(self) -> "LogRecord":
         if self.rank >= self.world_size:
             raise ValueError(
                 f"rank must be < world_size, got rank={self.rank}, world_size={self.world_size}."
@@ -320,8 +321,8 @@ def build_log_record(
     schema_version: int = SCHEMA_VERSION,
     event: str = EVENT_UPDATE,
     phase: str = PHASE_TRAIN,
-) -> LogRecordV1:
-    """Normalize task values, then construct a validated LogRecordV1."""
+) -> LogRecord:
+    """Normalize task values, then construct a validated LogRecord."""
     if schema_version != SCHEMA_VERSION:
         raise SchemaError(
             f"unsupported schema_version {schema_version}; writer supports {SCHEMA_VERSION}."
@@ -335,7 +336,7 @@ def build_log_record(
     metrics_n, nonfinite = normalize_metrics(metrics)
 
     try:
-        return LogRecordV1(
+        return LogRecord(
             schema_version=1,
             time=float(time),
             run_id=run_id,
@@ -356,8 +357,8 @@ def build_log_record(
         raise SchemaError(str(exc)) from exc
 
 
-def parse_record(payload: Mapping[str, Any]) -> LogRecordV1:
-    """Reconstruct a validated LogRecordV1 from serialized schema-v1 JSON.
+def parse_record(payload: Mapping[str, Any]) -> LogRecord:
+    """Reconstruct a validated LogRecord from serialized schema-v1 JSON.
 
     Does not re-run task-side normalization. Metrics/dims/nonfinite are taken
     as already-serialized interchange values so the nonfinite sidecar is kept.
@@ -369,7 +370,7 @@ def parse_record(payload: Mapping[str, Any]) -> LogRecordV1:
 
     Returns
     -------
-    LogRecordV1
+    LogRecord
         Frozen validated record.
 
     Raises
@@ -385,7 +386,7 @@ def parse_record(payload: Mapping[str, Any]) -> LogRecordV1:
             f"parse_record supports {SCHEMA_VERSION}."
         )
     try:
-        return LogRecordV1(
+        return LogRecord(
             schema_version=1,
             time=payload["time"],
             run_id=payload["run_id"],

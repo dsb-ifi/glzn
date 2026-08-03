@@ -4,7 +4,7 @@ Local-first, vendor-neutral training metrics for HPC compute nodes.
 
 **The schema is the public contract. Sinks are replaceable adapters.**
 
-Schema v1 is implemented as a frozen **Pydantic v2** model (`LogRecordV1`).
+Schema v1 is implemented as a frozen **Pydantic v2** model (`LogRecord`).
 Pydantic is an implementation and validation mechanism. The serialized JSON
 schema is the public contract. Future internal model refactors must preserve
 schema-v1 JSON compatibility.

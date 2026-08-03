@@ -1,11 +1,11 @@
-"""LogCollator: normalize → LogRecordV1 → sink fan-out."""
+"""LogCollator: normalize → LogRecord → sink fan-out."""
 from __future__ import annotations
 
 import time as time_mod
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
-from .schema import LogRecordV1, build_log_record
+from .schema import LogRecord, build_log_record
 from .sinks import JSONLSink, LogSink, StdoutSink
 
 
@@ -95,8 +95,8 @@ class LogCollator:
         metrics: Mapping[str, Any] | None = None,
         dims: Mapping[str, Any] | None = None,
         time: float | None = None,
-    ) -> LogRecordV1:
-        """Normalize, validate one LogRecordV1, fan the same frozen instance out."""
+    ) -> LogRecord:
+        """Normalize, validate one LogRecord, fan the same frozen instance out."""
         if self._closed:
             raise RuntimeError("LogCollator is closed.")
         record = build_log_record(

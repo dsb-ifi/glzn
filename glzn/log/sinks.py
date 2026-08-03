@@ -6,13 +6,13 @@ import logging
 from pathlib import Path
 from typing import Any, Mapping, Protocol, Sequence, TextIO
 
-from .schema import LogRecordV1
+from .schema import LogRecord
 
 _STDOUT_LOGGER_NAME = "glzn.log.stdout"
 
 
 class LogSink(Protocol):
-    def log(self, record: LogRecordV1) -> None: ...
+    def log(self, record: LogRecord) -> None: ...
 
     def flush(self) -> None: ...
 
@@ -45,7 +45,7 @@ class JSONLSink:
             # Hold the handle open; line buffering so each write is a full line.
             self._fh = open(self.path, "a", encoding="utf-8", buffering=1)
 
-    def log(self, record: LogRecordV1) -> None:
+    def log(self, record: LogRecord) -> None:
         if not self.enabled or self._fh is None:
             return
         if self._closed:
@@ -115,7 +115,7 @@ class StdoutSink:
             logger.addHandler(handler)
         return logger
 
-    def _format_metric(self, record: LogRecordV1, key: str, value: Any) -> str:
+    def _format_metric(self, record: LogRecord, key: str, value: Any) -> str:
         nf = record.nonfinite or {}
         if key in nf:
             kind = nf[key]
@@ -131,7 +131,7 @@ class StdoutSink:
             return f"{key}={value:.6g}"
         return f"{key}={value}"
 
-    def log(self, record: LogRecordV1) -> None:
+    def log(self, record: LogRecord) -> None:
         if not self.enabled or self._closed:
             return
         payload = record.model_dump(mode="json", exclude_none=True)
