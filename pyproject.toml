@@ -26,6 +26,10 @@ dev = [
     "pyright",
 ]
 
+[tool.setuptools.packages.find]
+include = ["glzn*"]
+exclude = ["rsc*", "tests*"]
+
 [tool.pyright]
 include = ["glzn", "tests"]
 pythonVersion = "3.12"

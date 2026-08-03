@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import inspect
 from typing import Any, Mapping
 
 import torch
@@ -57,10 +58,19 @@ def load_checkpoint(
             continue
         target = state[name]
         if hasattr(target, "load_state_dict"):
-            target.load_state_dict(value["state_dict"], strict=strict)
+            _load_state_dict(target, value["state_dict"], strict=strict)
         else:
             restored[name] = _unpack_state(value)
     return restored
+
+
+def _load_state_dict(target: Any, state_dict: Any, *, strict: bool) -> None:
+    load = target.load_state_dict
+    parameters = inspect.signature(load).parameters
+    if "strict" in parameters:
+        load(state_dict, strict=strict)
+    else:
+        load(state_dict)
 
 
 def _pack_state(obj: Any) -> Any:
