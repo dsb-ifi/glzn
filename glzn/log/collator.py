@@ -2,11 +2,10 @@
 from __future__ import annotations
 
 import time as time_mod
-import warnings
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
-from .schema import LogRecordV1, SchemaError, build_log_record
+from .schema import LogRecordV1, build_log_record
 from .sinks import JSONLSink, LogSink, StdoutSink
 
 
@@ -139,26 +138,3 @@ class LogCollator:
 
     def __exit__(self, exc_type, exc, tb) -> None:
         self.close()
-
-    def __call__(self, **logging_kwargs: Any) -> None:
-        warnings.warn(
-            "LogCollator.__call__ is removed; use log_update() for schema-v1 "
-            "update records.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        raise SchemaError(
-            "LogCollator no longer accepts free-form per-microbatch logs. "
-            "Use log_update(...) with task-supplied scalar metrics."
-        )
-
-    @classmethod
-    def standard_logger(cls, *args: Any, **kwargs: Any) -> "LogCollator":
-        warnings.warn(
-            "LogCollator.standard_logger is removed; use LogCollator.local(...).",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        raise SchemaError(
-            "standard_logger has been removed. Use LogCollator.local(run_id=..., root=..., ...)."
-        )

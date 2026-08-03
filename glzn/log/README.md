@@ -175,6 +175,23 @@ and any nonlinear sufficient-statistic metrics.
 state over the accumulation window and assigns `b.metrics` on the closing
 microbatch only.
 
+Gate finalized metrics on the pre-batch update flag. Setting `b.metrics` every
+microbatch with a per-micro loss logs only the closing microbatch’s values
+(silent wrong loss if that was meant to be an average or sum):
+
+```python
+# task maintains window_loss over the open accumulation window
+with proc.batch(tracker=tracker, phase=Phase.TRAIN) as b:
+    b.outputs = model(x)
+    micro_loss = loss_fn(b.outputs, y)
+    b.loss = micro_loss / accum_steps
+    window_loss = window_loss + float(micro_loss.detach())
+    if tracker.s.is_update_step:
+        b.metrics = {"loss/total": window_loss / tracker.s.bucket_size}
+        window_loss = 0.0
+tracker = b.updated_tracker
+```
+
 **`glzn.log` owns** schema construction, scalar normalization (torch/NumPy →
 Python), Pydantic validation, routing, JSONL persistence, and stdout presentation.
 

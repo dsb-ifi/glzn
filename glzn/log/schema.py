@@ -117,11 +117,14 @@ def classify_nonfinite(value: float) -> NonFiniteKind:
 
 
 def normalize_dims(dims: Mapping[str, Any] | None) -> dict[str, DimensionScalar]:
-    """Task dims → plain Python scalars (non-finite rejected)."""
+    """Task dims → plain Python scalars (non-finite rejected).
+
+    Metric/dim *names* are validated on ``LogRecordV1`` construction, not here.
+    """
     raw = {} if dims is None else dict(dims)
     out: dict[str, DimensionScalar] = {}
     for key, value in raw.items():
-        name = validate_name(str(key), kind="dimension")
+        name = str(key)
         if isinstance(value, float) and not math.isfinite(value):
             raise SchemaError(f"dimension {name!r} rejects non-finite float.")
         if torch.is_tensor(value) and value.numel() == 1:
@@ -138,26 +141,23 @@ def normalize_dims(dims: Mapping[str, Any] | None) -> dict[str, DimensionScalar]
 def normalize_metrics(
     metrics: Mapping[str, Any] | None,
 ) -> tuple[dict[str, MetricScalar], dict[str, NonFiniteKind]]:
-    """Task metrics → Python scalars + nonfinite sidecar (no tensors remain)."""
+    """Task metrics → Python scalars + nonfinite sidecar (no tensors remain).
+
+    Coerces scalar torch/NumPy values, splits non-finite floats into
+    ``None`` + sidecar, and delegates remaining type checks to
+    ``normalize_scalar``. Metric *names* are validated on ``LogRecordV1``.
+    """
     raw = {} if metrics is None else dict(metrics)
     out: dict[str, MetricScalar] = {}
     nonfinite: dict[str, NonFiniteKind] = {}
     for key, value in raw.items():
-        name = validate_name(str(key), kind="metric")
+        name = str(key)
         if torch.is_tensor(value):
             if value.numel() != 1:
                 raise SchemaError(f"metric {name!r} rejects non-scalar tensor.")
             value = value.detach().cpu().reshape(()).item()
         elif _is_numpy_scalar(value):
             value = value.item()
-        elif np is not None and isinstance(value, np.ndarray):
-            raise SchemaError(f"metric {name!r} rejects NumPy arrays.")
-        elif isinstance(value, str):
-            raise SchemaError(
-                f"metric {name!r} rejects strings; put categorical values in dims."
-            )
-        elif isinstance(value, (list, tuple, dict, set, Mapping)):
-            raise SchemaError(f"metric {name!r} rejects nested/sequence values.")
 
         if isinstance(value, float) and not math.isfinite(value):
             out[name] = None
@@ -304,10 +304,6 @@ class LogRecordV1(BaseModel):
         return self.model_dump(mode="json", exclude_none=True)
 
 
-# Public alias used by older call sites / tests that still say LogRecord.
-LogRecord = LogRecordV1
-
-
 def build_log_record(
     *,
     time: float,
@@ -357,4 +353,54 @@ def build_log_record(
             nonfinite=nonfinite or None,
         )
     except (ValidationError, ValueError, TypeError) as exc:
+        raise SchemaError(str(exc)) from exc
+
+
+def parse_record(payload: Mapping[str, Any]) -> LogRecordV1:
+    """Reconstruct a validated LogRecordV1 from serialized schema-v1 JSON.
+
+    Does not re-run task-side normalization. Metrics/dims/nonfinite are taken
+    as already-serialized interchange values so the nonfinite sidecar is kept.
+
+    Parameters
+    ----------
+    payload : Mapping[str, Any]
+        Mapping from ``model_dump_jsonl_payload`` / ``json.loads``.
+
+    Returns
+    -------
+    LogRecordV1
+        Frozen validated record.
+
+    Raises
+    ------
+    SchemaError
+        If ``schema_version`` is not 1 or the payload fails validation.
+    """
+    if not isinstance(payload, Mapping):
+        raise SchemaError(f"payload must be a mapping, got {type(payload).__name__}.")
+    if payload.get("schema_version") != SCHEMA_VERSION:
+        raise SchemaError(
+            f"unsupported schema_version {payload.get('schema_version')!r}; "
+            f"parse_record supports {SCHEMA_VERSION}."
+        )
+    try:
+        return LogRecordV1(
+            schema_version=1,
+            time=payload["time"],
+            run_id=payload["run_id"],
+            event=payload.get("event", EVENT_UPDATE),
+            phase=payload.get("phase", PHASE_TRAIN),
+            epoch=payload["epoch"],
+            iteration=payload["iteration"],
+            fullstep=payload["fullstep"],
+            rank=payload["rank"],
+            world_size=payload["world_size"],
+            update_succeeded=payload["update_succeeded"],
+            step_skipped=payload["step_skipped"],
+            dims=payload.get("dims", {}),
+            metrics=payload.get("metrics", {}),
+            nonfinite=payload.get("nonfinite", None),
+        )
+    except (ValidationError, ValueError, TypeError, KeyError) as exc:
         raise SchemaError(str(exc)) from exc
