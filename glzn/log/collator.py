@@ -1,97 +1,164 @@
-import os, time, json, torch, logging
-from typing import Sequence
+"""LogCollator: normalize → LogRecordV1 → sink fan-out."""
+from __future__ import annotations
 
-from .loggers import (
-    AbstractLogger, ProgressLogger, LossLogger, LRLogger, 
-    GPULogger, DeltaTimeLogger, AccuracyLogger
-)
+import time as time_mod
+import warnings
+from pathlib import Path
+from typing import Any, Mapping, Sequence
 
-LoggerSequence = Sequence[AbstractLogger]
-
-
-def _getrunlog():
-    logger = logging.getLogger('glzn.log')
-    logger.setLevel(logging.DEBUG)
-    ch = logging.StreamHandler()
-    ch.setLevel(logging.DEBUG)
-    logfmt = logging.Formatter('%(levelname)s:%(asctime)s | %(message)s')
-    ch.setFormatter(logfmt)
-    logger.addHandler(ch)
-    return logger
-
-
-applog = _getrunlog()
+from .schema import LogRecordV1, SchemaError, build_log_record
+from .sinks import JSONLSink, LogSink, StdoutSink
 
 
 class LogCollator:
+    """Build versioned update records and fan them out to sinks.
+
+    The collator does not compute task metrics, average microbatches, inspect
+    model I/O, or run distributed collectives. Callers supply already-correct
+    **update-level** scalar metrics.
+
+    ``b.metrics`` on a Processor batch must contain finalized effective-update
+    metrics written by the task on the closing microbatch. The processor does
+    not combine per-microbatch metric mappings.
+    """
 
     def __init__(
         self,
-        runid:str, # TODO: We probably don't need this to be required.
-        root:str,
-        rank:int,
-        local_rank:int,
-        loggers:LoggerSequence,
-        logfoldername:str='log',
-        stdout:bool=False,
-        drop_debug_entries:Sequence[str]=['time', 'cfg'],
+        *,
+        run_id: str,
+        rank: int = 0,
+        world_size: int = 1,
+        sinks: Sequence[LogSink] | None = None,
     ):
-        self.runid = runid
-        self.loggers = loggers
-        self.save_folder = os.path.join(root, logfoldername)
-        self.file_name = f"{runid}_{rank}_{local_rank}.jsonl"
-        self.rank = rank
-        self.local_rank = local_rank
-        self.stdout = stdout
-        self.drop_debug_entries = drop_debug_entries
-        os.makedirs(self.save_folder, exist_ok=True)
-        self.file_path = os.path.join(self.save_folder, self.file_name)
-
-    @property
-    def _use_applog(self) -> bool:
-        return self.stdout and self.rank == 0 and self.local_rank == 0
-
-    def get_entries(self, **logging_kwargs):
-        def t2item(val):
-            if torch.is_tensor(val):
-                if val.numel() == 1:
-                    return val.item()
-                return val.tolist()
-            return val
-        return {
-            k:t2item(v) for logger in self.loggers 
-            for k, v in logger(**logging_kwargs).items()
-        }
-
-    def __call__(self, **logging_kwargs):
-        timestamp = logging_kwargs.get('time', time.time())
-        log_entry = {
-            'time': timestamp, 
-            **self.get_entries(**logging_kwargs)
-        }
-        mode = 'a' if os.path.isfile(self.file_path) else 'w'
-        if self._use_applog:
-            applog.debug(
-                ' '.join([
-                    f"{k}={v}" for k,v in log_entry.items() 
-                    if k not in self.drop_debug_entries
-                ])
-            )
-        with open(self.file_path, mode) as log_file:
-            log_file.write(json.dumps(log_entry))
-            log_file.write('\n')
+        if not isinstance(run_id, str) or not run_id:
+            raise ValueError("run_id must be a non-empty string.")
+        if rank < 0:
+            raise ValueError(f"rank must be >= 0, got {rank}.")
+        if world_size < 1:
+            raise ValueError(f"world_size must be >= 1, got {world_size}.")
+        self.run_id = run_id
+        self.rank = int(rank)
+        self.world_size = int(world_size)
+        self.sinks: list[LogSink] = list(sinks or ())
+        self._closed = False
 
     @classmethod
-    def standard_logger(
-        cls, runid:str, root:str, rank:int, local_rank:int,
-        stdout:bool, logfoldername:str='log'
-    ):
-        loggers = [
-            ProgressLogger(), DeltaTimeLogger(), LossLogger(), 
-            AccuracyLogger(1), AccuracyLogger(5), LRLogger(),
-            GPULogger()
+    def local(
+        cls,
+        *,
+        run_id: str,
+        root: str | Path,
+        rank: int = 0,
+        world_size: int = 1,
+        logfoldername: str = "log",
+        stdout: bool = True,
+        rank_local: bool = False,
+        metric_allowlist: Sequence[str] | None = None,
+    ) -> "LogCollator":
+        """Construct a collator with canonical JSONL (+ optional stdout / rank-local)."""
+        root = Path(root)
+        log_dir = root / logfoldername
+        sinks: list[LogSink] = [
+            JSONLSink(
+                log_dir / "metrics.jsonl",
+                rank=rank,
+                world_size=world_size,
+                enabled=(rank == 0),
+            )
         ]
-        return cls(
-            runid, root, rank, local_rank, loggers, 
-            logfoldername, stdout
+        if rank_local:
+            sinks.append(
+                JSONLSink(
+                    log_dir / "rank" / f"{rank}.jsonl",
+                    rank=rank,
+                    world_size=world_size,
+                    enabled=True,
+                )
+            )
+        if stdout:
+            sinks.append(
+                StdoutSink(
+                    rank=rank,
+                    enabled=(rank == 0),
+                    metric_allowlist=metric_allowlist,
+                )
+            )
+        return cls(run_id=run_id, rank=rank, world_size=world_size, sinks=sinks)
+
+    def log_update(
+        self,
+        *,
+        epoch: int,
+        iteration: int,
+        fullstep: int,
+        update_succeeded: bool,
+        step_skipped: bool,
+        metrics: Mapping[str, Any] | None = None,
+        dims: Mapping[str, Any] | None = None,
+        time: float | None = None,
+    ) -> LogRecordV1:
+        """Normalize, validate one LogRecordV1, fan the same frozen instance out."""
+        if self._closed:
+            raise RuntimeError("LogCollator is closed.")
+        record = build_log_record(
+            time=time if time is not None else time_mod.time(),
+            run_id=self.run_id,
+            epoch=epoch,
+            iteration=iteration,
+            fullstep=fullstep,
+            rank=self.rank,
+            world_size=self.world_size,
+            update_succeeded=update_succeeded,
+            step_skipped=step_skipped,
+            metrics=metrics,
+            dims=dims,
+        )
+        for sink in self.sinks:
+            sink.log(record)
+        return record
+
+    def flush(self) -> None:
+        for sink in self.sinks:
+            sink.flush()
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        errors: list[BaseException] = []
+        for sink in self.sinks:
+            try:
+                sink.close()
+            except BaseException as exc:
+                errors.append(exc)
+        if errors:
+            raise errors[0]
+
+    def __enter__(self) -> "LogCollator":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.close()
+
+    def __call__(self, **logging_kwargs: Any) -> None:
+        warnings.warn(
+            "LogCollator.__call__ is removed; use log_update() for schema-v1 "
+            "update records.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        raise SchemaError(
+            "LogCollator no longer accepts free-form per-microbatch logs. "
+            "Use log_update(...) with task-supplied scalar metrics."
+        )
+
+    @classmethod
+    def standard_logger(cls, *args: Any, **kwargs: Any) -> "LogCollator":
+        warnings.warn(
+            "LogCollator.standard_logger is removed; use LogCollator.local(...).",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        raise SchemaError(
+            "standard_logger has been removed. Use LogCollator.local(run_id=..., root=..., ...)."
         )

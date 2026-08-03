@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import time
 from contextlib import nullcontext
-from dataclasses import dataclass
-from typing import Any, Callable, ContextManager, NamedTuple, Optional, Protocol, Sequence
+from dataclasses import dataclass, field
+from typing import Any, Callable, ContextManager, Mapping, NamedTuple, Optional, Protocol, Sequence
 
 import torch
 import torch.nn as nn
@@ -57,10 +57,15 @@ class _BatchContext:
     context: CallableContext
     phase: Optional[Phase]
     now: Optional[float]
-    logging_kwargs: dict[str, Any]
 
     outputs: Optional[TensorSequence] = None
     loss: Optional[Tensor] = None
+    # Finalized *update-level* scalars for the effective update batch.
+    # The task owns accumulation across microbatches and should assign these
+    # on the closing microbatch only. The processor records the mapping as-is
+    # and never merges microbatch metrics or infers loss from ``loss``.
+    metrics: dict[str, Any] = field(default_factory=dict)
+    dims: dict[str, Any] = field(default_factory=dict)
     updated_tracker: Optional[StepTracker] = None
     step_skipped: bool = False
     last_lr: Optional[float] = None
@@ -79,11 +84,9 @@ class _BatchContext:
         self.updated_tracker, self.step_skipped, self.last_lr = self.processor._process_batch(
             tracker=self.tracker,
             loss=self.loss,
-            inputs=self.inputs,
-            outputs=self.outputs,
-            targets=self.targets,
             context=self.context,
-            **self.logging_kwargs,
+            metrics=self.metrics,
+            dims=self.dims,
         )
         return False
 
@@ -127,14 +130,6 @@ class Processor:
     def _opt_params(optimizer: Optimizer):
         return [p for group in optimizer.param_groups for p in group["params"]]
 
-    @staticmethod
-    def _clean(tseq: Optional[TensorSequence]) -> Optional[TensorSequence]:
-        if torch.is_tensor(tseq) and isinstance(tseq, Tensor):
-            return tseq.detach().cpu()
-        if isinstance(tseq, Sequence):
-            return [t.detach().cpu() if torch.is_tensor(t) else t for t in tseq]
-        return tseq
-
     def _backward(self, loss: Tensor) -> None:
         if self.deps.scaler is None:
             loss.backward()
@@ -159,35 +154,32 @@ class Processor:
         self.deps.scaler.update()
         return self.deps.scaler.get_scale() >= old_scale
 
-    def _log_batch(
+    def _emit_update_log(
         self,
         *,
         tracker: StepTracker,
-        loss: Tensor,
-        inputs: Optional[TensorSequence],
-        outputs: Optional[TensorSequence],
-        targets: Optional[TensorSequence],
+        update_succeeded: bool,
         step_skipped: bool,
         last_lr: Optional[float],
-        **logging_kwargs,
+        metrics: Mapping[str, Any],
+        dims: Mapping[str, Any],
     ) -> None:
         if self.logger is None:
             return
-        self.logger(
+        # Build a private metrics map so processor defaults do not mutate caller state.
+        out_metrics: dict[str, Any] = dict(metrics)
+        if last_lr is not None:
+            # optim/lr = parameter group 0 learning rate (not model-wide unique LR).
+            out_metrics.setdefault("optim/lr", last_lr)
+        self.logger.log_update(
             time=time.time(),
             epoch=tracker.s.epoch,
             iteration=tracker.s.phase_iter,
-            phase=tracker.s.phase.value,
             fullstep=tracker.s.fullstep,
-            microstep=tracker.s.microstep,
-            loss=loss.item(),
-            inputs=self._clean(inputs),
-            outputs=self._clean(outputs),
-            targets=self._clean(targets),
+            update_succeeded=update_succeeded,
             step_skipped=step_skipped,
-            last_lr=last_lr,
-            training=tracker.s.is_train,
-            **logging_kwargs,
+            metrics=out_metrics,
+            dims=dims,
         )
 
     def _process_batch(
@@ -195,11 +187,9 @@ class Processor:
         *,
         tracker: StepTracker,
         loss: Optional[Tensor],
-        inputs: Optional[TensorSequence],
-        outputs: Optional[TensorSequence],
-        targets: Optional[TensorSequence],
         context: CallableContext,
-        **logging_kwargs,
+        metrics: Mapping[str, Any],
+        dims: Mapping[str, Any],
     ) -> tuple[StepTracker, bool, Optional[float]]:
         if loss is None:
             raise ValueError("Batch loss must be populated inside processor.batch() context.")
@@ -207,17 +197,17 @@ class Processor:
         step_skipped = False
         last_lr: Optional[float] = None
         updated = tracker
+        update_attempted = False
 
         if updated.s.is_train:
+            # Capture before branch mutation: on_update resets microstep;
+            # next_micro advances it. step_skipped alone cannot recover this.
+            update_attempted = updated.s.is_update_step
+
             with context():
                 self._backward(loss)
 
-            # ``is_update_step`` is defined on the pre-increment microstep:
-            # the microbatch about to be counted completes the open bucket when
-            # (microstep + 1) == bucket_size. Do not call ``next_micro`` before
-            # this check — that off-by-one collapses accumulation to every batch
-            # and can skip the tail flush when bucket_size == 1.
-            if updated.s.is_update_step:
+            if update_attempted:
                 self._clip_gradients()
 
                 # Successful-update clock shared by LR/WD apply, EMA momentum,
@@ -240,29 +230,24 @@ class Processor:
             else:
                 updated = updated.next_micro()
 
-        # Always report the active group LR after the batch action. On
-        # non-update microbatches this is the LR last applied (or the
-        # optimizer default); schedules are only reapplied on update attempts.
         if self.deps.optimizer.param_groups:
             last_lr = float(self.deps.optimizer.param_groups[0].get("lr", 0.0))
 
         self._acc_skipped = (self._acc_skipped + int(step_skipped)) * int(step_skipped)
-        # Log the post-update / post-micro state for this batch, but before
-        # phase_iter advances so ``iteration`` is the 0-based index of the
-        # batch just processed.
-        log_tracker = updated
-        updated = updated.advance_iter()
 
-        self._log_batch(
-            tracker=log_tracker,
-            loss=loss,
-            inputs=inputs,
-            outputs=outputs,
-            targets=targets,
-            step_skipped=step_skipped,
-            last_lr=last_lr,
-            **logging_kwargs,
-        )
+        # Log after the update attempt (post-action fullstep) and before
+        # phase_iter advances so iteration is the closing microbatch index.
+        if update_attempted:
+            self._emit_update_log(
+                tracker=updated,
+                update_succeeded=not step_skipped,
+                step_skipped=step_skipped,
+                last_lr=last_lr,
+                metrics=metrics,
+                dims=dims,
+            )
+
+        updated = updated.advance_iter()
         return updated, step_skipped, last_lr
 
     def batch(
@@ -274,8 +259,14 @@ class Processor:
         phase: Optional[Phase] = None,
         now: Optional[float] = None,
         context: CallableContext = nullcontext,
-        **logging_kwargs,
     ) -> _BatchContext:
+        """Open a batch context.
+
+        Set ``loss`` (required) and optionally ``metrics`` / ``dims`` for
+        update-level logging. ``inputs`` / ``targets`` / ``outputs`` are never
+        passed to the durable logger. Task-supplied ``metrics`` are emitted
+        only when this microbatch attempts an optimizer update.
+        """
         return _BatchContext(
             processor=self,
             tracker=tracker,
@@ -284,7 +275,4 @@ class Processor:
             context=context,
             phase=phase,
             now=now,
-            logging_kwargs=logging_kwargs,
         )
-
-

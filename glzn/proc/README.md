@@ -7,7 +7,7 @@ Context-based training and validation processing with support for:
 - AMP gradient scaling (`GradScaler`)
 - scheduled optimizer updates (global and per-group)
 - scheduled EMA updates
-- optional batch-level logging through `LogCollator`
+- optional **update-level** logging through schema-v1 `LogCollator` (JSONL)
 
 The `proc` package is intentionally split into composable modules:
 
@@ -145,15 +145,36 @@ When AMP is enabled, optimizer updates are executed through the scaler and skipp
 
 ---
 
-## Logging Hooks
+## Logging (schema v1)
 
-Pass a `LogCollator` into `Processor(..., logger=...)` to log one entry per processed batch.
+Pass a `LogCollator` into `Processor(..., logger=...)` to emit **one durable
+JSONL record per optimizer update attempt** (including AMP skips). Non-update
+accumulation microbatches do not log.
 
-The processor emits keys such as:
+Task-supplied **finalized update-level** scalars go on the batch context:
 
-- `epoch`, `iteration`, `phase`, `fullstep`, `microstep`
-- `loss`, `last_lr`, `step_skipped`, `training`
-- `inputs`, `outputs`, `targets` (detached to CPU when tensors)
+```python
+# Task maintains window state across microbatches, then on the closing batch:
+with proc.batch(tracker=tracker, phase=Phase.TRAIN) as b:
+    b.outputs = model(x)
+    b.loss = loss / accum_steps          # for backward only
+    b.metrics = {"loss/total": update_loss}  # effective-batch metric (task-owned)
+    b.dims = {"scope": "local"}
+tracker = b.updated_tracker
+```
+
+**Ownership contract:** `b.metrics` is whatever mapping the task sets on that
+microbatch. The processor does **not** average, sum, or otherwise combine
+metrics across an accumulation window. If the task leaves `b.metrics` empty on
+the closing microbatch, no loss metric is logged (the final `b.loss` tensor is
+never inferred as `loss/total`).
+
+The processor may inject `optim/lr` as **parameter group 0** learning rate.
+It never logs raw inputs/outputs/targets and never detaches training tensors
+for logging.
+
+Logged `fullstep` matches checkpoint `StepTracker.fullstep` (post-attempt).
+See `glzn/log/README.md` for the full schema.
 
 ---
 
