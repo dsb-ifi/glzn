@@ -21,9 +21,9 @@ The `proc` package is intentionally split into composable modules:
 ## Core Concepts
 
 1. `StepTracker` is the source of truth for loop progress.
-2. `Processor.batch(...)` returns a context object where you set `outputs` and `loss`.
-3. On context exit, `Processor` performs the train/val action automatically.
-4. `tracker = b.updated_tracker` is required after every batch.
+2. `Processor` owns the mutable tracker reference.
+3. `Processor.batch(...)` returns the transaction object for one microbatch.
+4. Call `b.backward(loss)` exactly once in train batches; proc applies accumulation scaling.
 
 Train batches can trigger backward/update. Validation batches never update optimizer/EMA.
 
@@ -61,36 +61,25 @@ tracker = StepTracker.init(
 
 proc = Processor(
     ProcDeps(model=model, optimizer=optimizer),
+    tracker=tracker,
     gradient_clipping=1.0,
 )
 
 for _epoch in range(total_epochs):
     model.train()
     for inputs, targets in train_loader:
-        with proc.batch(
-            tracker=tracker,
-            inputs=inputs,
-            targets=targets,
-            phase=Phase.TRAIN,
-        ) as b:
-            b.outputs = model(inputs)
-            b.loss = loss_fn(b.outputs, targets)
-        tracker = b.updated_tracker
+        with proc.batch(phase=Phase.TRAIN) as b:
+            outputs = model(inputs)
+            loss = loss_fn(outputs, targets)
+            b.backward(loss)
 
     model.eval()
     with torch.no_grad():
         for inputs, targets in val_loader:
-            with proc.batch(
-                tracker=tracker,
-                inputs=inputs,
-                targets=targets,
-                phase=Phase.VAL,
-            ) as b:
-                b.outputs = model(inputs)
-                b.loss = loss_fn(b.outputs, targets)
-            tracker = b.updated_tracker
+            with proc.batch(phase=Phase.VAL):
+                _outputs = model(inputs)
 
-    tracker = tracker.next_epoch(now=time.time())
+    proc.next_epoch(now=time.time())
 ```
 
 ---
@@ -123,6 +112,7 @@ proc = Processor(
         ema=ema,
         ema_scheduler=ema_scheduler,
     ),
+    tracker=tracker,
     gradient_clipping=1.0,
 )
 ```
@@ -154,20 +144,20 @@ accumulation microbatches do not log.
 Task-supplied **finalized update-level** scalars go on the batch context:
 
 ```python
-# Task maintains window state across microbatches, then on the closing batch:
-with proc.batch(tracker=tracker, phase=Phase.TRAIN) as b:
-    b.outputs = model(x)
-    b.loss = loss / accum_steps          # for backward only
-    b.metrics = {"loss/total": update_loss}  # effective-batch metric (task-owned)
+# Task may add update-level metrics on the closing batch:
+with proc.batch(phase=Phase.TRAIN) as b:
+    loss = loss_fn(model(x), y)
+    b.backward(loss)
+    if b.is_update_step:
+        b.metrics["train/accuracy"] = accuracy
     b.dims = {"scope": "local"}
-tracker = b.updated_tracker
 ```
 
 **Ownership contract:** `b.metrics` is whatever mapping the task sets on that
 microbatch. The processor does **not** average, sum, or otherwise combine
-metrics across an accumulation window. If the task leaves `b.metrics` empty on
-the closing microbatch, no loss metric is logged (the final `b.loss` tensor is
-never inferred as `loss/total`).
+metrics across an accumulation window. The processor separately logs detached,
+unscaled `loss/total` as the mean of the train losses passed to `b.backward`
+over the update window.
 
 The processor may inject `optim/lr` as **parameter group 0** learning rate.
 It never logs raw inputs/outputs/targets and never detaches training tensors
@@ -225,11 +215,12 @@ iterator, early manual phase switch, or bad bookkeeping — not a silent discard
 
 ### Checkpoint resume
 
-`StepTracker` serializes counters (`microstep`, `fullstep`, iters, epoch, …).
-It does **not** serialize `.grad` accumulation buffers.
+`Processor.state_dict()` serializes the coherent optimization bundle:
+tracker counters, optimizer state, scaler state when present, and skip counter.
+It does **not** serialize model parameters, EMA target parameters, or `.grad`
+accumulation buffers.
 
-**Exact resume is enforced at save time** via `StepTracker.assert_checkpointable()`
-(also invoked by `to_dict()` / `save_checkpoint`):
+**Exact resume is enforced at save time** via `Processor.assert_checkpointable()`:
 
 - training: `microstep == 0` required (closed window after success **or** AMP skip)
 - validation: always allowed
@@ -241,9 +232,9 @@ serialization for mid-window resume.
 
 ## Notes and Gotchas
 
-1. Always assign `tracker = b.updated_tracker` after each batch.
-2. `StepTracker.next_epoch(...)` is not implicit; call it at the end of every epoch.
-3. Validation batches still require a loss for logging/consistency in current implementation.
-4. With gradient accumulation, updates happen only when `StepState.is_update_step` is true **before** counting the microbatch.
+1. Do not thread trackers through the loop; read `proc.s` when needed.
+2. `Processor.next_epoch(...)` is not implicit; call it at the end of every epoch.
+3. Validation batches advance the validation iterator only. Validation metric aggregation/logging is intentionally not implemented here yet.
+4. With gradient accumulation, updates happen only when `b.is_update_step` is true for the active batch.
 5. `Processor.cancel_run` can be polled to stop if too many consecutive skipped updates occur.
 6. Mid-window checkpoints and mid-window phase exits are rejected; see **Checkpoint resume** and **Phase transitions**.

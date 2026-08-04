@@ -180,23 +180,19 @@ microbatch with a per-micro loss logs only the closing microbatch’s values
 (silent wrong loss if that was meant to be an average or sum):
 
 ```python
-# task maintains window_loss over the open accumulation window
-with proc.batch(tracker=tracker, phase=Phase.TRAIN) as b:
-    b.outputs = model(x)
-    micro_loss = loss_fn(b.outputs, y)
-    b.loss = micro_loss / accum_steps
-    window_loss = window_loss + float(micro_loss.detach())
-    if tracker.s.is_update_step:
-        b.metrics = {"loss/total": window_loss / tracker.s.bucket_size}
-        window_loss = 0.0
-tracker = b.updated_tracker
+with proc.batch(phase=Phase.TRAIN) as b:
+    micro_loss = loss_fn(model(x), y)
+    b.backward(micro_loss)
+    if b.is_update_step:
+        b.metrics["train/accuracy"] = update_level_accuracy
 ```
 
 **`glzn.log` owns** schema construction, scalar normalization (torch/NumPy →
 Python), Pydantic validation, routing, JSONL persistence, and stdout presentation.
 
-Update-level losses (e.g. `loss/total`) must be **task-supplied**. The processor
-never logs the final microbatch loss tensor as the update loss.
+`loss/total` is the one processor-owned metric: it is logged as the detached,
+unscaled mean of losses passed to `b.backward(...)` over the update window.
+Other update-level metrics remain task-supplied.
 
 ---
 
@@ -241,18 +237,14 @@ logger = LogCollator.local(
     stdout=True,
 )
 
-proc = Processor(ProcDeps(model=model, optimizer=opt), logger=logger)
+proc = Processor(ProcDeps(model=model, optimizer=opt), tracker=tracker, logger=logger)
 
-with proc.batch(tracker=tracker, phase=Phase.TRAIN) as b:
-    b.outputs = model(x)
-    b.loss = loss_fn(b.outputs, y) / accum_steps
+with proc.batch(phase=Phase.TRAIN) as b:
+    loss = loss_fn(model(x), y)
+    b.backward(loss)
     # Only emitted if this microbatch closes an accumulation window:
-    b.metrics = {
-        "loss/total": update_level_loss,  # task-defined effective-batch loss
-        "time/batch_s": batch_seconds,
-    }
+    b.metrics["time/batch_s"] = batch_seconds
     b.dims = {"scope": "local"}
-tracker = b.updated_tracker
 ```
 
 ---
