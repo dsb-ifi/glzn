@@ -4,6 +4,13 @@ import torch
 import torch.distributed as dist
 from torch import Tensor
 
+from glzn.run import (
+    all_reduce_sum,
+    collective_count_device,
+    collective_device,
+    distributed_enabled,
+)
+
 Scalar = bool | int | float | None
 
 
@@ -38,25 +45,24 @@ class WeightedScalar:
         group: dist.ProcessGroup | None = None,
     ) -> "WeightedScalar":
         """SUM-reduce the accumulated total and count across distributed ranks."""
-        if not dist.is_available() or not dist.is_initialized():
+        if not distributed_enabled():
             return self
         if self._reduced:
             raise RuntimeError("WeightedScalar.all_reduce_() was already called.")
 
-        backend = distributed_backend(group)
-        device = collective_device(backend, self.total)
+        device = collective_device(self.total, group=group)
         if self.total is None:
             self.total = torch.zeros((), dtype=torch.float32, device=device)
-        elif self.total.device != device and backend == "nccl":
+        elif self.total.device != device:
             self.total = self.total.to(device)
 
         count = torch.tensor(
             self.count,
             dtype=torch.int64,
-            device=collective_count_device(backend, device),
+            device=collective_count_device(device, group=group),
         )
-        dist.all_reduce(self.total, op=dist.ReduceOp.SUM, group=group)
-        dist.all_reduce(count, op=dist.ReduceOp.SUM, group=group)
+        self.total = all_reduce_sum(self.total, group=group)
+        count = all_reduce_sum(count, group=group)
         self.count = int(count.item())
         self._reduced = True
         return self
@@ -126,22 +132,18 @@ class MultiDenominatorMetricWindow:
     ) -> dict[str, int]:
         if not self.global_counts:
             return {}
-        if not dist.is_available() or not dist.is_initialized():
+        if not distributed_enabled():
             return dict(self.global_counts)
 
-        backend = distributed_backend(group)
         reference = self._reference_total()
-        device = collective_count_device(
-            backend,
-            collective_device(backend, reference),
-        )
+        device = collective_count_device(collective_device(reference, group=group), group=group)
         names = list(self.global_counts)
         counts = torch.tensor(
             [self.global_counts[name] for name in names],
             dtype=torch.int64,
             device=device,
         )
-        dist.all_reduce(counts, op=dist.ReduceOp.SUM, group=group)
+        counts = all_reduce_sum(counts, group=group)
         return {
             name: int(counts[idx].item())
             for idx, name in enumerate(names)
@@ -163,32 +165,3 @@ def _finalize_metric(
         return None
     return metric.mean()
 
-
-def distributed_backend(group: dist.ProcessGroup | None) -> str:
-    try:
-        return str(dist.get_backend(group))
-    except ValueError:
-        return "gloo"
-
-
-def collective_device(backend: str, reference: Tensor | None) -> torch.device:
-    if backend == "nccl":
-        if reference is not None and reference.device.type == "cuda":
-            return reference.device
-        if torch.cuda.is_available():
-            return torch.device("cuda", torch.cuda.current_device())
-        raise RuntimeError("NCCL metric reduction requires CUDA.")
-    return torch.device("cpu") if reference is None else reference.device
-
-
-def collective_count_device(
-    backend: str,
-    preferred: torch.device,
-) -> torch.device:
-    if backend == "nccl":
-        if preferred.type == "cuda":
-            return preferred
-        if torch.cuda.is_available():
-            return torch.device("cuda", torch.cuda.current_device())
-        raise RuntimeError("NCCL metric count reduction requires CUDA.")
-    return torch.device("cpu")
