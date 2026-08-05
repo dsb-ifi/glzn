@@ -59,6 +59,8 @@ tracker = StepTracker.init(
     microbatch_size=microbatch_size,
     accum_steps=accum_steps,
     total_epochs=total_epochs,
+    train_iters_per_epoch=len(train_loader),
+    val_iters_per_epoch=len(val_loader),
 )
 
 proc = Processor(
@@ -229,6 +231,90 @@ accumulation buffers.
 
 Saving mid-window fails with a clear `RuntimeError`. Do not add gradient
 serialization for mid-window resume.
+
+---
+
+## Training Geometry, Resume, and Restart
+
+Training microbatch geometry is loader-authoritative. Assembly should build the
+training `DataLoader` first, then pass `len(train_loader)` as
+`train_iters_per_epoch` to `StepTracker.init(...)`. `StepTracker` consumes that
+microbatch count and derives optimizer-update opportunities from
+`accum_steps`, including a valid shortened final accumulation window.
+
+This avoids reconstructing loader behavior from sample counts. The concrete
+failure mode was:
+
+```text
+25,000 samples / batch_size 256
+sample-derived ceil geometry = 98
+actual drop-last DataLoader geometry = 97
+```
+
+Sample counts remain useful for reporting, but they do not override explicit
+loader geometry. Distributed training scripts require equal rank-local training
+geometry before the first synchronized train microbatch: `len(train_loader)`,
+`train_iters_per_epoch`, `total_train_steps`, and `accum_steps` must agree
+across ranks.
+
+Current resume means exact continuation of the same training run. Exact resume
+restores model state, optimizer state, scaler state, EMA/task state where
+applicable, tracker/progress state, scheduler position, dataset state, and
+rank-local state where applicable. Processor resume therefore requires
+compatible training geometry and schedule horizon. The hard compatibility check
+covers at least `train_iters_per_epoch`, `accum_steps`, `microbatch_size`,
+`total_epochs`, and `total_train_steps`; derived diagnostics such as
+`updates_per_epoch` may appear in error messages but are not independent sources
+of truth.
+
+Validation geometry is not part of training-resume compatibility. Changing
+validation batch size, validation loader length, validation dataset size, or
+`val_iters_per_epoch` must not by itself invalidate training resume. Exact
+checkpoint loading still restores the checkpointed tracker state.
+
+Changing `total_epochs` is not ordinary resume: it changes finite-horizon
+schedules such as cosine LR, WD, or EMA schedules. Extending a schedule is a new
+optimization policy, not a neutral continuation.
+
+### Future selective restart
+
+Exact resume and restart should remain separate concepts:
+
+```text
+exact resume:
+    restore complete run state
+    require matching training geometry and schedule
+
+restart:
+    selectively restore chosen state
+    construct fresh tracker and schedules
+    explicitly allow a new training trajectory
+```
+
+Future restart modes may include model weights only, model + EMA, model +
+optimizer momentum, model + optimizer + scaler, selective task state, a new
+scheduler horizon, changed dataset or loader geometry, or changed world size.
+An illustrative API shape could be:
+
+```python
+restart_from_checkpoint(
+    checkpoint,
+    restore_model=True,
+    restore_optimizer=True,
+    restore_ema=True,
+    restore_task_state=False,
+    restore_tracker=False,
+    restore_schedulers=False,
+)
+```
+
+This is only a sketch. Open design questions include whether optimizer step
+counters should be retained or reset; whether Adam moments or momentum should be
+retained when LR schedules change; whether weight-decay and EMA schedules need
+independent restart policies; how rank-local dataset/RNG state should be
+handled; whether changed world size requires sampler-state reset; whether warmup
+should restart; and how scheduler phase should be initialized when selected
+optimizer state is retained.
 
 ---
 

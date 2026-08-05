@@ -1,4 +1,4 @@
-from .metric import MultiDenominatorMetricWindow, WeightedScalar
+from .accumulate import MultiDenominatorMetricWindow, WeightedScalar
 
 __all__ = [
     "MultiDenominatorMetricWindow",

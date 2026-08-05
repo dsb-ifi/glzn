@@ -4,7 +4,16 @@ import time
 import warnings
 from contextlib import ExitStack, nullcontext
 from dataclasses import dataclass, field
-from typing import Any, Callable, ContextManager, Mapping, NamedTuple, Protocol, Sequence, cast
+from typing import (
+    Any,
+    Callable,
+    ContextManager,
+    Mapping,
+    NamedTuple,
+    Protocol,
+    Sequence,
+    cast,
+)
 
 import torch
 import torch.nn as nn
@@ -16,9 +25,8 @@ from torch.optim import Optimizer
 from ..log.collator import LogCollator
 from .ema import EMA
 from .sched import Scheduler
-from .step import Phase, StepState, StepTracker
+from .step import Phase, StepState, StepTracker, ceildiv
 from .wrap import ScheduledEMA, ScheduledOptimizer
-
 
 CallableContext = Callable[[], ContextManager[Any]]
 EMASource = Callable[[nn.Module], nn.Module]
@@ -241,7 +249,9 @@ class Processor:
         return state
 
     def load_state_dict(self, state: Mapping[str, Any], strict: bool = True) -> None:
-        self.tracker = StepTracker.from_dict(state["tracker"])
+        tracker = StepTracker.from_dict(state["tracker"])
+        self._assert_resume_geometry_compatible(tracker)
+        self.tracker = tracker
         self.deps.optimizer.load_state_dict(state["optimizer"])
         if self.deps.scaler is not None:
             if "scaler" not in state:
@@ -255,6 +265,36 @@ class Processor:
         self._backward_called = False
         self._active_batch = None
         self._aborted = False
+
+    def _assert_resume_geometry_compatible(self, tracker: StepTracker) -> None:
+        current = self.s
+        checkpoint = tracker.s
+        current_updates = ceildiv(current.train_iters_per_epoch, current.accum_steps)
+        checkpoint_updates = ceildiv(checkpoint.train_iters_per_epoch, checkpoint.accum_steps)
+        fields = (
+            ("train_iters_per_epoch", current.train_iters_per_epoch, checkpoint.train_iters_per_epoch),
+            ("accum_steps", current.accum_steps, checkpoint.accum_steps),
+            ("microbatch_size", current.microbatch_size, checkpoint.microbatch_size),
+            ("total_epochs", current.total_epochs, checkpoint.total_epochs),
+            ("updates_per_epoch", current_updates, checkpoint_updates),
+            ("total_train_steps", current.total_train_steps, checkpoint.total_train_steps),
+        )
+        mismatches = [
+            f"{name}: current={current_value}, checkpoint={checkpoint_value}"
+            for name, current_value, checkpoint_value in fields
+            if current_value != checkpoint_value
+        ]
+        if mismatches:
+            context = (
+                f"accum_steps current={current.accum_steps}, checkpoint={checkpoint.accum_steps}; "
+                f"updates_per_epoch current={current_updates}, checkpoint={checkpoint_updates}; "
+                f"total_train_steps current={current.total_train_steps}, "
+                f"checkpoint={checkpoint.total_train_steps}"
+            )
+            raise RuntimeError(
+                "Processor checkpoint geometry is incompatible with current run "
+                "geometry: " + "; ".join(mismatches) + "; " + context
+            )
 
     def assert_checkpointable(self) -> None:
         if self._aborted:

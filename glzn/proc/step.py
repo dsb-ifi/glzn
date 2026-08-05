@@ -217,9 +217,19 @@ class StepTracker:
         accum_steps: int,
         total_epochs: int,
         start_epoch: int = 0,
+        train_iters_per_epoch: int | None = None,
+        val_iters_per_epoch: int | None = None,
     ) -> "StepTracker":
-        train_iters = ceildiv(trainsamples, microbatch_size) if trainsamples > 0 else 0
-        val_iters = ceildiv(valsamples, microbatch_size) if valsamples > 0 else 0
+        train_iters = (
+            train_iters_per_epoch
+            if train_iters_per_epoch is not None
+            else ceildiv(trainsamples, microbatch_size) if trainsamples > 0 else 0
+        )
+        val_iters = (
+            val_iters_per_epoch
+            if val_iters_per_epoch is not None
+            else ceildiv(valsamples, microbatch_size) if valsamples > 0 else 0
+        )
         s = StepState(
             epoch=start_epoch,
             phase=Phase.TRAIN,
