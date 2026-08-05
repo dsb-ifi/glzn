@@ -861,6 +861,12 @@ class iTarDataset(Dataset[Any]):
         '''
         if not callable(mapping):
             raise TypeError("Provided mapping is not callable.")
+        if self._logical_sample_output:
+            raise RuntimeError(
+                'map() cannot be attached after map(), because map() has '
+                'already produced one logical sample object. A second map() '
+                'is not currently supported.'
+            )
 
         sig = inspect.signature(mapping)
         params = [
