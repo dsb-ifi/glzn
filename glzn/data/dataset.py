@@ -1,37 +1,53 @@
 from __future__ import annotations
-import multiprocessing as mp
-import string, torchvision, json, functools, inspect, xxhash, numpy as np
-from contextlib import contextmanager
-from torch.utils.data import Dataset
-from pathlib import Path
-from os import PathLike
-from collections.abc import Mapping as ABCMapping
-from typing import Any, Callable, Sequence, Mapping
-from packaging.version import parse as parse_version
 
-from .encoders import DEFAULT_DECODERS, PseudoExtension, PIL
-from .maptrafo import Map, MapAll, MapGrouped, MapTuple, DefaultIdentity
-from .sampler import IdentitySampler, MultiFeistelSampler
+import inspect
+import json
+import multiprocessing as mp
+import string
+from collections.abc import Mapping as ABCMapping
+from contextlib import contextmanager
+from os import PathLike
+from pathlib import Path
+from typing import Any, Callable, Mapping, Sequence
+
+import numpy as np
+import torchvision
+import xxhash
+from packaging.version import parse as parse_version
+from torch.utils.data import Dataset
+
+from .encoders import DEFAULT_DECODERS, PIL, PseudoExtension
 from .imgbrowser import browse_dataset
 from .itar.fold import iTarFold, iTarRetriever
 from .itar.utils import StemHelper, stripext
+from .maptrafo import Map, MapAll, MapGrouped, MapTuple
+from .sampler import IdentitySampler, MultiFeistelSampler
 
 USE_TV_TENSOR = parse_version(torchvision.__version__) >= parse_version('0.16')
 _valid_pseudo_extensions = PseudoExtension._valid_pseudo_extensions
+Transform = Callable[..., Any]
+Decoder = Callable[[bytes], Any]
 
 
 # TODO: Possibly Pseudoepoch: A selected artificial number of samples that can be anything, 
 # including infinity for a fully stochastic stream-based sampling procedure.
 
-def _compose(fs):
-    def c(f,g):
-        def c2(x):
-            return g(f(x))
-        return c2
-    return functools.reduce(c, fs, DefaultIdentity())
+
+class _ComposeTransforms:
+    def __init__(self, transforms: Sequence[Transform]):
+        self.transforms: tuple[Transform, ...] = tuple(transforms)
+
+    def __call__(self, value: Any) -> Any:
+        for transform in self.transforms:
+            value = transform(value)
+        return value
 
 
-def _finalize_sample(result:Any) -> tuple:
+def _compose(fs: Sequence[Transform]) -> _ComposeTransforms:
+    return _ComposeTransforms(fs)
+
+
+def _finalize_sample(result:Any) -> tuple[Any, ...]:
     '''Normalize transform-pipeline output to a sample field tuple.
 
     Public contract: the pipeline must yield a list or tuple of logical
@@ -55,9 +71,9 @@ def _finalize_sample(result:Any) -> tuple:
 
 
 def _parse_decoders(
-    fold:iTarFold, overrides:dict[str,Callable]|None=None
-) -> dict[int,Callable]:
-    _dec = {**DEFAULT_DECODERS}
+    fold:iTarFold, overrides:dict[str,Decoder]|None=None
+) -> dict[int,Decoder]:
+    _dec: dict[str, Decoder] = {**DEFAULT_DECODERS}
     if overrides is None:
         overrides = {}
     _dec.update(overrides)
@@ -97,7 +113,7 @@ class _BrowserWrapper:
             )
             self._idxindex = dataset.extensions.index('_idx') if '_idx' in dataset.extensions else None
             self._fidindex = dataset.extensions.index('_fid') if '_fid' in dataset.extensions else None
-        except:
+        except ValueError:
             curext = ', '.join(dataset.extensions)
             raise ValueError(
                 f'No current extensions {self.img_ext}. '
@@ -126,12 +142,12 @@ class _BrowserWrapper:
         return sample[self._imgindex], label, meta
 
 
-class iTarDataset(Dataset):
+class iTarDataset(Dataset[Any]):
 
     def __init__(
         self,
         dataset:str,
-        loc:str|PathLike,
+        loc:str|PathLike[Any],
         fold:str,
         extensions:Sequence[str]|None=None,
         parse_if_missing:bool=False,
@@ -176,6 +192,7 @@ class iTarDataset(Dataset):
         # Init transforms
         self.transforms = []
         self._trafo = _compose(self.transforms)
+        self._logical_sample_output = False
 
         # Init sampling details
         self._epoch = 0
@@ -189,6 +206,8 @@ class iTarDataset(Dataset):
         self._shuffle_enabled = False
         self._shuffle_shard_mixing = False
         self._shuffle_rounds = 3
+        self._bucket_size = 1
+        self._sampler: MultiFeistelSampler | IdentitySampler
         self._update_fold_state_vars()
 
         # Grouping is an explicit opt-in mode initialized via add_grouping().
@@ -202,7 +221,7 @@ class iTarDataset(Dataset):
         self._sync_epoch_from_shared()
         return self._distributed_len(self._global_len())
 
-    def __getitem__(self, idx:int) -> tuple:
+    def __getitem__(self, idx:int) -> Any:
         self._sync_epoch_from_shared()
         if idx < 0:
             idx = len(self) + idx
@@ -216,7 +235,7 @@ class iTarDataset(Dataset):
             return self._getitem_grouped(idx)
         return self._getitem_standard(idx)
 
-    def _getitem_standard(self, idx:int) -> tuple:
+    def _getitem_standard(self, idx:int) -> Any:
         n = self._nrealext
         idx_start = idx * n
         out = {}
@@ -239,9 +258,11 @@ class iTarDataset(Dataset):
                 case '_fid':
                     out[ext] = int(fid) if fid is not None else None
 
-        return _finalize_sample(self._trafo([out[e] for e in self.extensions]))
+        return self._finalize_transform_output(
+            self._trafo([out[e] for e in self.extensions])
+        )
 
-    def _getitem_grouped(self, idx:int) -> tuple:
+    def _getitem_grouped(self, idx:int) -> Any:
         n = self._nrealext
         idx_start = idx * n
         out = {}
@@ -255,7 +276,9 @@ class iTarDataset(Dataset):
                 continue
             out[ext] = self.decoders[extid](bytes(self.retriever.from_row(row)))
 
-        return _finalize_sample(self._trafo([out[e] for e in extensions]))
+        return self._finalize_transform_output(
+            self._trafo([out[e] for e in extensions])
+        )
 
     @staticmethod
     def supports_tv_tensor() -> bool:
@@ -263,10 +286,24 @@ class iTarDataset(Dataset):
         '''
         return USE_TV_TENSOR
 
-    def _add_trafo(self, trafo:Callable) -> 'iTarDataset':
+    def _add_trafo(self, trafo:Transform) -> 'iTarDataset':
         self.transforms.append(trafo)
         self._trafo = _compose(self.transforms)
         return self
+
+    def _add_field_trafo(self, trafo:Transform, caller:str) -> 'iTarDataset':
+        if self._logical_sample_output:
+            raise RuntimeError(
+                f'{caller} cannot be attached after map(), because map() '
+                'produces one logical sample object rather than field-aligned '
+                'sample outputs.'
+            )
+        return self._add_trafo(trafo)
+
+    def _finalize_transform_output(self, result:Any) -> Any:
+        if self._logical_sample_output:
+            return result
+        return _finalize_sample(result)
     
     def _sync_extension_state(self):
         """Resync all extension-derived metadata from self.extensions and fold state."""
@@ -666,7 +703,7 @@ class iTarDataset(Dataset):
         self._update_fold_state_vars()
         return self
 
-    def filter_stems_by_json(self, path:str|PathLike) -> "iTarDataset":
+    def filter_stems_by_json(self, path:str|PathLike[Any]) -> "iTarDataset":
         # TODO: Unfortunate naming; clashes with the export functionality of the browser.
         self._assert_grouping_inactive('filter_stems_by_json()')
         if not isinstance(path, Path):
@@ -690,7 +727,7 @@ class iTarDataset(Dataset):
 
     def lookup_stems(
         self,
-        stems:Sequence[str]|str|PathLike,
+        stems:Sequence[str]|str|PathLike[Any],
         extensions:Sequence[str]|None=None
     ) -> dict[str, dict[str, Any]]:
         """Retrieve decoded files by exact stem and extension.
@@ -800,15 +837,17 @@ class iTarDataset(Dataset):
 
         return out
 
-    def map(self, mapping:Callable) -> "iTarDataset":
+    def map(self, mapping:Transform) -> "iTarDataset":
         '''Takes a mapping and applies it to the tuple of extensions.
 
         For `mapping = f` and `extensions = ['jpg', 'cls'], this will return
-        the fields produced by ``f(<sample>.jpg, <sample>.cls)``.
+        the logical sample object produced by ``f(<sample>.jpg, <sample>.cls)``.
 
-        The mapping must return a ``list`` or ``tuple`` of logical output
-        fields. Strings, dicts, and bare scalars are rejected (they are not
-        silently expanded element-wise).
+        ``map()`` is the boundary where archive-field tuple arity stops being
+        semantically meaningful. The mapping may return any picklable Python
+        object accepted by the downstream DataLoader/collate path. Use
+        ``map_tuple()``, ``map_group()``, or ``map_all()`` for field-aligned
+        transforms that preserve sample-field tuple semantics.
 
         Parameters
         ----------
@@ -837,9 +876,10 @@ class iTarDataset(Dataset):
                 f"Mapping function for map() must accept {n_expected} positional arguments, "
                 f"but got {n_actual}."
             )
+        self._logical_sample_output = True
         return self._add_trafo(Map(mapping))
 
-    def map_all(self, mapping:Callable) -> "iTarDataset":
+    def map_all(self, mapping:Transform) -> "iTarDataset":
         '''Takes a mapping and applies it to all extensions.
 
         For `mapping = f` and `extensions = ['jpg', 'cls'], this will return
@@ -857,9 +897,15 @@ class iTarDataset(Dataset):
         '''
         if not callable(mapping):
             raise TypeError("Provided mapping is not callable.")
-        return self._add_trafo(MapAll(mapping))
+        if self._logical_sample_output:
+            raise RuntimeError(
+                'map_all() cannot be attached after map(), because map() '
+                'produces one logical sample object rather than field-aligned '
+                'sample outputs.'
+            )
+        return self._add_field_trafo(MapAll(mapping), 'map_all()')
 
-    def map_group(self, mapping:Callable, indices:Sequence[int]) -> "iTarDataset":
+    def map_group(self, mapping:Transform, indices:Sequence[int]) -> "iTarDataset":
         '''Takes a mapping and applies it to specific indices of extensions.
 
         For `mapping = f`, `extensions = ['jpg', 'cls'], and `indices = (0,)` this
@@ -879,9 +925,18 @@ class iTarDataset(Dataset):
         '''
         if not callable(mapping):
             raise TypeError("Provided mapping is not callable.")
-        return self._add_trafo(MapGrouped(mapping, self._validate_transform_indices(indices, 'map_group()')))
+        if self._logical_sample_output:
+            raise RuntimeError(
+                'map_group() cannot be attached after map(), because map() '
+                'produces one logical sample object rather than field-aligned '
+                'sample outputs.'
+            )
+        return self._add_field_trafo(
+            MapGrouped(mapping, self._validate_transform_indices(indices, 'map_group()')),
+            'map_group()',
+        )
 
-    def map_tuple(self, *maps:Callable) -> "iTarDataset":
+    def map_tuple(self, *maps:Transform) -> "iTarDataset":
         """Applies given mappings to individual extensions of dataset items.
 
         For `maps = [f1, f2]` and `extensions = ['jpg', 'cls']`, this will return
@@ -911,13 +966,19 @@ class iTarDataset(Dataset):
         """
         if not all(callable(m) for m in maps):
             raise TypeError("One or more mapping is not callable.")
+        if self._logical_sample_output:
+            raise RuntimeError(
+                'map_tuple() cannot be attached after map(), because map() '
+                'produces one logical sample object rather than field-aligned '
+                'sample outputs.'
+            )
         num_ext = self._expected_output_arity()
         if len(maps) != num_ext:
             raise ValueError(
                 f"Incorrect number of transforms provided. "
                 f"Expected {num_ext}, got {len(maps)}."
             )
-        return self._add_trafo(MapTuple(maps))
+        return self._add_field_trafo(MapTuple(maps), 'map_tuple()')
 
     def set_distributed(
         self,
