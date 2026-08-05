@@ -1,3 +1,4 @@
+from .accumulate import WeightedScalar
 from .collator import LogCollator
 from .schema import (
     SCHEMA_VERSION,
@@ -15,6 +16,7 @@ __all__ = [
     "LogSink",
     "JSONLSink",
     "StdoutSink",
+    "WeightedScalar",
     "SchemaError",
     "build_log_record",
     "parse_record",

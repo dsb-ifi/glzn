@@ -26,6 +26,8 @@ The `proc` package is intentionally split into composable modules:
 4. Call `b.backward(loss)` exactly once in train batches; proc applies accumulation scaling.
 
 Train batches can trigger backward/update. Validation batches never update optimizer/EMA.
+`Processor.batch(phase=Phase.VAL)` only advances validation progress state;
+validation metric aggregation remains task-owned.
 
 ---
 

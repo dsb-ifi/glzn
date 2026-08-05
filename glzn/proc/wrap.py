@@ -98,11 +98,18 @@ class ScheduledEMA:
         ema: EMA,
         momentum_scheduler: Scheduler | None = None,
         source: Callable | None = None,
+        schedule_mode: str = "multiplicative",
     ):
+        if schedule_mode not in ("multiplicative", "absolute"):
+            raise ValueError(
+                "schedule_mode must be 'multiplicative' or 'absolute', "
+                f"got {schedule_mode}."
+            )
         self.ema = ema
         self._base_momentum = ema.decay
         self.momentum_scheduler = momentum_scheduler
         self.source = source
+        self.schedule_mode = schedule_mode
         if self.momentum_scheduler is not None and not self.momentum_scheduler.normalize:
             warnings.warn("Unnormalized momentum scheduler detected. Normalizing and reinitializing schedule.")
             self.momentum_scheduler.normalize = True
@@ -110,7 +117,11 @@ class ScheduledEMA:
 
     def update_parameters(self, model, step_state:StepState):
         if self.momentum_scheduler is not None:
-            self.ema.decay = self.momentum_scheduler(step_state) * self._base_momentum
+            value = self.momentum_scheduler(step_state)
+            if self.schedule_mode == "absolute":
+                self.ema.decay = value
+            else:
+                self.ema.decay = value * self._base_momentum
         source = model if self.source is None else self.source(model)
         self.ema.update_parameters(source)
 

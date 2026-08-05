@@ -46,6 +46,7 @@ class ProcDeps(NamedTuple):
     ema: EMA | None = None
     ema_scheduler: Scheduler | None = None
     ema_source: EMASource | None = None
+    ema_schedule_mode: str = "multiplicative"
     update_hooks: Sequence[UpdateHook] = ()
 
 
@@ -171,6 +172,7 @@ class Processor:
                 ema=deps.ema,
                 momentum_scheduler=deps.ema_scheduler,
                 source=deps.ema_source,
+                schedule_mode=deps.ema_schedule_mode,
             )
         )
 
