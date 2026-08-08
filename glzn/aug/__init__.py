@@ -13,6 +13,11 @@ from .dino import (
     build_dino_augment,
     build_dino_pipeline,
     collate_dino_views,
+    dino_finalize_steps,
+    dino_float01_steps,
+    dino_geometry_steps,
+    dino_normalize_steps,
+    dino_photometric_steps,
 )
 
 __all__ = [
@@ -28,4 +33,9 @@ __all__ = [
     "build_imagenet_eval_augment",
     "build_mixup_cutmix_collate",
     "collate_dino_views",
+    "dino_finalize_steps",
+    "dino_float01_steps",
+    "dino_geometry_steps",
+    "dino_normalize_steps",
+    "dino_photometric_steps",
 ]

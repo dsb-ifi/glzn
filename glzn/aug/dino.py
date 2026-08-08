@@ -22,6 +22,82 @@ class DINOAugmentationPipeline:
     collate: Callable
 
 
+def dino_geometry_steps(
+    *,
+    size: int,
+    scale: tuple[float, float],
+    flip_p: float = 0.5,
+) -> list[Callable]:
+    """Shared spatial stage: RandomResizedCrop + horizontal flip."""
+
+    return [
+        v2.RandomResizedCrop(
+            size,
+            scale=scale,
+            interpolation=InterpolationMode.BICUBIC,
+        ),
+        v2.RandomHorizontalFlip(p=flip_p),
+    ]
+
+
+def dino_photometric_steps(
+    *,
+    blur_prob: float = 0.0,
+    solarize_prob: float = 0.0,
+) -> list[Callable]:
+    """DINO photometric stack without geometry or tensor finalization.
+
+    Color jitter (p=0.8) and grayscale (p=0.2) are always included. Gaussian
+    blur and solarization are optional with view-specific probabilities.
+    """
+
+    steps: list[Callable] = list(_color_jittering())
+    if blur_prob > 0:
+        steps.append(
+            v2.RandomApply(
+                [
+                    v2.GaussianBlur(
+                        kernel_size=9,
+                        sigma=(0.1, 2.0),
+                    )
+                ],
+                p=blur_prob,
+            )
+        )
+    if solarize_prob > 0:
+        steps.append(v2.RandomApply([Solarization()], p=solarize_prob))
+    return steps
+
+
+def dino_float01_steps() -> list[Callable]:
+    """Convert image-like input to a float tensor in ``[0, 1]``."""
+
+    return [
+        v2.ToImage(),
+        v2.ToDtype(torch.float32, scale=True),
+    ]
+
+
+def dino_normalize_steps() -> list[Callable]:
+    """ImageNet channel normalization (model-input domain)."""
+
+    return [
+        v2.Normalize(
+            mean=IMAGENET_DEFAULT_MEAN,
+            std=IMAGENET_DEFAULT_STD,
+        ),
+    ]
+
+
+def dino_finalize_steps(*, normalize: bool = True) -> list[Callable]:
+    """Tensor conversion, optionally followed by ImageNet normalization."""
+
+    steps = dino_float01_steps()
+    if normalize:
+        steps.extend(dino_normalize_steps())
+    return steps
+
+
 def build_dino_augment(
     *,
     recipe: DINORecipe = "dinov2",
@@ -154,31 +230,16 @@ def _crop_branch(
     blur_prob: float,
     solarize_prob: float,
 ) -> v2.Compose:
-    steps: list[Callable] = [
-        v2.RandomResizedCrop(
-            size,
-            scale=scale,
-            interpolation=InterpolationMode.BICUBIC,
-        ),
-        v2.RandomHorizontalFlip(p=0.5),
-        *_color_jittering(),
-    ]
-    if blur_prob > 0:
-        steps.append(
-            v2.RandomApply(
-                [
-                    v2.GaussianBlur(
-                        kernel_size=9,
-                        sigma=(0.1, 2.0),
-                    )
-                ],
-                p=blur_prob,
-            )
-        )
-    if solarize_prob > 0:
-        steps.append(v2.RandomApply([Solarization()], p=solarize_prob))
-    steps.extend(_final_tensor_steps())
-    return v2.Compose(steps)
+    return v2.Compose(
+        [
+            *dino_geometry_steps(size=size, scale=scale),
+            *dino_photometric_steps(
+                blur_prob=blur_prob,
+                solarize_prob=solarize_prob,
+            ),
+            *dino_finalize_steps(normalize=True),
+        ]
+    )
 
 
 def _color_jittering() -> list[Callable]:
@@ -199,14 +260,9 @@ def _color_jittering() -> list[Callable]:
 
 
 def _final_tensor_steps() -> list[Callable]:
-    return [
-        v2.ToImage(),
-        v2.ToDtype(torch.float32, scale=True),
-        v2.Normalize(
-            mean=IMAGENET_DEFAULT_MEAN,
-            std=IMAGENET_DEFAULT_STD,
-        ),
-    ]
+    """Backward-compatible alias for normalized finalize steps."""
+
+    return dino_finalize_steps(normalize=True)
 
 
 def _validate_size(name: str, value: int) -> None:
