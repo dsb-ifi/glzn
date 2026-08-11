@@ -1,6 +1,9 @@
 from __future__ import annotations
-from typing import Optional, Literal
+
+from typing import Literal, Optional
+
 from .basecfg import BaseConfig
+
 
 class RunConfig(BaseConfig):
     '''Standard GLZN RunConfig.
@@ -79,6 +82,10 @@ class RunConfig(BaseConfig):
         Number of rolling checkpoints to keep.
     logging_interval : int
         Interval for logging training progress (in iterations).
+    max_train_steps : int or None
+        Optional smoke/debug budget: stop training after this many **successful
+        optimizer updates** (``StepState.fullstep``). ``None`` means no limit
+        (full ``epochs`` schedule). Does not change scheduler table length.
     '''
     batch_size:int = 256
     epochs:int = 300
@@ -86,6 +93,7 @@ class RunConfig(BaseConfig):
     run_train:bool = True
     run_test:bool = True
     detect_anomaly:bool = False
+    max_train_steps:int | None = None
     num_workers:int = 4
     prefetch_factor:int = 2
     loader_drop_last:bool = True

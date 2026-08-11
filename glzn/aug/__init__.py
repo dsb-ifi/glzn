@@ -10,6 +10,7 @@ from .deit3 import (
 from .dino import (
     DINOAugment,
     DINOAugmentationPipeline,
+    DINORrcSpec,
     build_dino_augment,
     build_dino_pipeline,
     collate_dino_views,
@@ -18,12 +19,14 @@ from .dino import (
     dino_geometry_steps,
     dino_normalize_steps,
     dino_photometric_steps,
+    dino_rrc_spec,
 )
 
 __all__ = [
     "AugmentationPipeline",
     "DINOAugment",
     "DINOAugmentationPipeline",
+    "DINORrcSpec",
     "DefaultCollateWrapper",
     "Solarization",
     "build_deit3_augment",
@@ -38,4 +41,5 @@ __all__ = [
     "dino_geometry_steps",
     "dino_normalize_steps",
     "dino_photometric_steps",
+    "dino_rrc_spec",
 ]

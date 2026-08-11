@@ -9,6 +9,28 @@ def ceildiv(a: int, b: int) -> int:
     return -(-a // b)
 
 
+def train_step_budget_reached(
+    fullstep: int,
+    max_train_steps: int | None,
+) -> bool:
+    """Whether a smoke/debug successful-update budget has been met.
+
+    ``max_train_steps`` counts **successful optimizer updates** (the same clock
+    as ``StepState.fullstep``), not microbatches or dataloader iterations.
+    ``None`` means no budget. Values less than 1 are rejected.
+    """
+
+    if max_train_steps is None:
+        return False
+    if max_train_steps < 1:
+        raise ValueError(
+            f"max_train_steps must be None or >= 1, got {max_train_steps}."
+        )
+    if fullstep < 0:
+        raise ValueError(f"fullstep must be >= 0, got {fullstep}.")
+    return fullstep >= max_train_steps
+
+
 class Phase(str, Enum):
     TRAIN = "train"
     VAL = "val"

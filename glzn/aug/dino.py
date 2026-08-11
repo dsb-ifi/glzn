@@ -7,11 +7,15 @@ from torch import Tensor
 from torch.utils.data import default_collate
 from torchvision.transforms import v2
 from torchvision.transforms.functional import InterpolationMode
+from torchvision.transforms.v2 import functional as F
 
 from .deit3 import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD, Solarization
 
 DINORecipe = Literal["dinov1", "dinov2"]
 DINOOutputMode = Literal["dict", "flat"]
+
+# Default torchvision v2 RRC aspect-ratio range (matches RandomResizedCrop).
+_DEFAULT_RRC_RATIO: tuple[float, float] = (3.0 / 4.0, 4.0 / 3.0)
 
 
 @dataclass(frozen=True)
@@ -22,22 +26,118 @@ class DINOAugmentationPipeline:
     collate: Callable
 
 
+@dataclass(frozen=True)
+class DINORrcSpec:
+    """Shared RandomResizedCrop hyperparameters (v2), without flip policy.
+
+    Used by DINO multi-crop geometry and by consumers that need the same RRC
+    parameters (e.g. GenSSL shared global crop) without inheriting HFlip.
+    """
+
+    size: int
+    scale: tuple[float, float]
+    ratio: tuple[float, float] = _DEFAULT_RRC_RATIO
+    interpolation: InterpolationMode = InterpolationMode.BICUBIC
+    antialias: bool | None = True
+
+    def output_size(self) -> list[int]:
+        return [int(self.size), int(self.size)]
+
+    def as_transform(self) -> v2.RandomResizedCrop:
+        """Build a v2 ``RandomResizedCrop`` with these hyperparameters."""
+
+        return v2.RandomResizedCrop(
+            self.size,
+            scale=self.scale,
+            ratio=self.ratio,
+            interpolation=self.interpolation,
+            antialias=self.antialias,
+        )
+
+    def sample_params(self, img: object) -> tuple[int, int, int, int]:
+        """Sample ``(top, left, height, width)`` via v2 ``RandomResizedCrop``."""
+
+        return v2.RandomResizedCrop.get_params(
+            img,
+            scale=list(self.scale),
+            ratio=list(self.ratio),
+        )
+
+    def apply_crop(
+        self,
+        img: object,
+        top: int,
+        left: int,
+        height: int,
+        width: int,
+    ) -> object:
+        """Apply the sampled crop/resize with v2 functional API."""
+
+        return F.resized_crop(
+            img,
+            top,
+            left,
+            height,
+            width,
+            size=self.output_size(),
+            interpolation=self.interpolation,
+            antialias=self.antialias,
+        )
+
+
+def dino_rrc_spec(
+    *,
+    size: int,
+    scale: tuple[float, float],
+    ratio: tuple[float, float] = _DEFAULT_RRC_RATIO,
+    interpolation: InterpolationMode = InterpolationMode.BICUBIC,
+    antialias: bool | None = True,
+) -> DINORrcSpec:
+    """Factory for a shared DINO-style RRC hyperparameter bundle."""
+
+    _validate_size("size", size)
+    _validate_scale("scale", scale)
+    lo, hi = ratio
+    if not 0.0 < lo <= hi:
+        raise ValueError(f"ratio must satisfy 0 < lo <= hi, got {ratio}.")
+    return DINORrcSpec(
+        size=int(size),
+        scale=scale,
+        ratio=ratio,
+        interpolation=interpolation,
+        antialias=antialias,
+    )
+
+
 def dino_geometry_steps(
     *,
     size: int,
     scale: tuple[float, float],
     flip_p: float = 0.5,
+    ratio: tuple[float, float] = _DEFAULT_RRC_RATIO,
+    interpolation: InterpolationMode = InterpolationMode.BICUBIC,
+    antialias: bool | None = True,
 ) -> list[Callable]:
-    """Shared spatial stage: RandomResizedCrop + horizontal flip."""
+    """Shared spatial stage: RandomResizedCrop (+ optional horizontal flip).
 
-    return [
-        v2.RandomResizedCrop(
-            size,
+    RRC hyperparameters come from :func:`dino_rrc_spec`. Horizontal flip is a
+    separate DINO multi-crop policy and is not part of the RRC spec.
+    """
+
+    if not 0.0 <= flip_p <= 1.0:
+        raise ValueError(f"flip_p must lie in [0, 1], got {flip_p}.")
+    steps: list[Callable] = [
+        dino_rrc_spec(
+            size=size,
             scale=scale,
-            interpolation=InterpolationMode.BICUBIC,
-        ),
-        v2.RandomHorizontalFlip(p=flip_p),
+            ratio=ratio,
+            interpolation=interpolation,
+            antialias=antialias,
+        ).as_transform(),
     ]
+    if flip_p > 0.0:
+        steps.append(v2.RandomHorizontalFlip(p=flip_p))
+    return steps
 
 
 def dino_photometric_steps(
