@@ -20,6 +20,7 @@ from .dino import (
     dino_normalize_steps,
     dino_photometric_steps,
     dino_rrc_spec,
+    pack_dino_field_sample,
 )
 
 __all__ = [
@@ -42,4 +43,5 @@ __all__ = [
     "dino_normalize_steps",
     "dino_photometric_steps",
     "dino_rrc_spec",
+    "pack_dino_field_sample",
 ]

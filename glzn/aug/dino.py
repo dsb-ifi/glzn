@@ -1,4 +1,4 @@
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Literal
 
@@ -13,6 +13,7 @@ from .deit3 import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD, Solarization
 
 DINORecipe = Literal["dinov1", "dinov2"]
 DINOOutputMode = Literal["dict", "flat"]
+_NUM_GLOBAL_CROPS = 2
 
 # Default torchvision v2 RRC aspect-ratio range (matches RandomResizedCrop).
 _DEFAULT_RRC_RATIO: tuple[float, float] = (3.0 / 4.0, 4.0 / 3.0)
@@ -24,6 +25,30 @@ class DINOAugmentationPipeline:
 
     sample: Callable
     collate: Callable
+
+    @property
+    def field_transforms(self) -> tuple[Callable, ...]:
+        """Per-slot transforms when ``sample`` is a :class:`DINOAugment`."""
+
+        sample = self.sample
+        transforms = getattr(sample, "field_transforms", None)
+        if transforms is None:
+            raise AttributeError(
+                "DINO pipeline sample does not expose field_transforms "
+                "(expected DINOAugment)."
+            )
+        return tuple(transforms)
+
+    @property
+    def num_views(self) -> int:
+        sample = self.sample
+        n = getattr(sample, "num_views", None)
+        if n is None:
+            raise AttributeError(
+                "DINO pipeline sample does not expose num_views "
+                "(expected DINOAugment)."
+            )
+        return int(n)
 
 
 @dataclass(frozen=True)
@@ -304,23 +329,96 @@ class DINOAugment:
         self.local = local
         self.local_crops_number = local_crops_number
 
+    @property
+    def num_views(self) -> int:
+        """Logical view count: 2 globals + ``local_crops_number`` locals."""
+
+        return _NUM_GLOBAL_CROPS + int(self.local_crops_number)
+
+    @property
+    def field_transforms(self) -> tuple[Callable, ...]:
+        """Per-logical-slot transforms for ``iTarDataset.map_tuple``.
+
+        Use with repeated image extensions::
+
+            extensions = [image_ext] * augs.num_views
+            ds.map_tuple(*augs.field_transforms)
+        """
+
+        return (
+            self.global1,
+            self.global2,
+            *tuple(self.local for _ in range(self.local_crops_number)),
+        )
+
     def __call__(self, image: object) -> dict[str, object] | list[Tensor]:
+        # Direct PIL/tensor path for unit tests and non-iTar consumers.
         global_crops = [self.global1(image), self.global2(image)]
         local_crops = [self.local(image) for _ in range(self.local_crops_number)]
         if self.output == "flat":
             return [*global_crops, *local_crops]
-        return {
-            "global_crops": global_crops,
-            "global_crops_teacher": global_crops,
-            "local_crops": local_crops,
-            "offsets": (),
-        }
+        return pack_dino_field_sample(
+            (*global_crops, *local_crops),
+            local_crops_number=self.local_crops_number,
+        )
+
+
+def pack_dino_field_sample(
+    fields: Sequence[object],
+    *,
+    local_crops_number: int | None = None,
+    num_global: int = _NUM_GLOBAL_CROPS,
+) -> dict[str, object]:
+    """Pack a flat logical field tuple into a structured DINO view dict.
+
+    ``fields`` is ``(global0, global1, local0, …)`` as produced by
+    ``map_tuple(*DINOAugment.field_transforms)``.
+    """
+
+    fields = tuple(fields)
+    if local_crops_number is None:
+        if len(fields) < num_global:
+            raise ValueError(
+                f"DINO field sample must have at least {num_global} views, "
+                f"got {len(fields)}."
+            )
+        local_crops_number = len(fields) - num_global
+    expected = num_global + int(local_crops_number)
+    if len(fields) != expected:
+        raise ValueError(
+            f"DINO field sample expected {expected} views "
+            f"({num_global} global + {local_crops_number} local), got {len(fields)}."
+        )
+    global_crops = list(fields[:num_global])
+    local_crops = list(fields[num_global:])
+    return {
+        "global_crops": global_crops,
+        "global_crops_teacher": global_crops,
+        "local_crops": local_crops,
+        "offsets": (),
+    }
 
 
 def collate_dino_views(batch: Sequence[object]) -> object:
-    """Default-collate DINO dict or flat-list multi-view samples."""
+    """Collate DINO samples: structured dicts or flat field tuples.
 
-    return default_collate(list(batch))
+    Field tuples come from repeated-extension ``map_tuple`` pipelines and are
+    packed into the training-step dict before ``default_collate``.
+    """
+
+    packed: list[object] = []
+    for item in batch:
+        if isinstance(item, Mapping):
+            packed.append(item)
+            continue
+        if isinstance(item, Sequence) and not isinstance(item, (str, bytes)):
+            packed.append(pack_dino_field_sample(item))
+            continue
+        raise TypeError(
+            "DINO collate expects a view dict or a sequence of crop tensors; "
+            f"got {type(item).__name__}."
+        )
+    return default_collate(packed)
 
 
 def _crop_branch(

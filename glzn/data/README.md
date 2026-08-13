@@ -37,8 +37,130 @@ The `itar` package provides fast random access into tar shards via an index.
 1. Build/load dataset definitions (`dataset.py`).
 2. Resolve source storage (filesystem or iTar).
 3. Decode/encode fields (`encoders.py`).
-4. Apply mapping transforms (`maptrafo.py`).
-5. Iterate with sampler policy (`sampler.py`).
+4. Apply field-aligned mapping transforms (`maptrafo.py`).
+5. Optionally collapse logical arity for packaging.
+6. Iterate with sampler policy (`sampler.py`) / collate.
+
+## Logical field model
+
+`iTarDataset` is built around a **fixed logical field arity** from the ordered
+`extensions` list. Repeated extension names are intentional and first-class.
+
+```text
+physical archive members
+    ->
+ordered logical fields from extensions
+    ->
+arity-preserving transform graph  (map / map_tuple / map_all / map_group)
+    ->
+optional explicit arity collapse  (collapse_arity)
+    ->
+collate
+```
+
+### Physical vs logical extensions
+
+Physical decoder lookup uses the bare extension stem (`jpg`, `cls`, …).
+Logical schema positions are `len(extensions)` long, including repeats.
+
+```python
+# One on-disk jpg member, three logical image slots, one label.
+ds = iTarDataset(..., extensions=["jpg", "jpg", "jpg", "cls"])
+sample = ds[0]
+# sample is a 4-tuple; sample[0] is sample[1] is sample[2] before transforms
+# (same decoded object referenced at each logical slot).
+```
+
+Repeated slots initially **alias** the same decoded object. Per-slot transforms
+must be **functional / non-mutating**. Independent crops/augs on each slot are
+expressed with `map_tuple` / `map_group`, not by cloning in the dataset.
+
+### Stable logical field names
+
+Unique extensions keep their bare name. Repeated extensions are indexed in
+appearance order:
+
+```text
+extensions = ["jpg", "jpg", "jpg", "cls"]
+logical names = ("jpg.0", "jpg.1", "jpg.2", "cls")
+```
+
+Access remains positional. Names are available as `ds.logical_field_names` and
+are accepted by `collapse_arity` alongside indices.
+
+**Grouping caveat:** `logical_field_names` always describe the configured
+`extensions` schema. After `add_grouping()`, the effective output arity follows
+the grouping template, which may differ. Name-based `collapse_arity` is
+**rejected** in that mode; use positional indices only.
+
+### Field-aligned transforms (arity-preserving)
+
+| API | Meaning |
+|-----|---------|
+| `map(f)` | Joint map: `f(field_0, …, field_{N-1}) -> N fields` |
+| `map_tuple(f0, f1, …)` | One callable per logical position |
+| `map_all(f)` | Same unary callable on every field |
+| `map_group(f, indices)` | Joint map on selected positions only |
+
+Invariants:
+
+- none of these change logical arity `N`;
+- results must be list/tuple (namedtuple allowed) with `len(result) == N`;
+- dicts/scalars are rejected (not a free-form sample escape hatch);
+- the four operations compose in any order;
+- arity is checked after every field map (fails immediately on drift);
+- `map(f)` validates that `f` accepts `N` positional parameters (unless `*args`).
+
+```python
+from collections import namedtuple
+
+Sample = namedtuple("Sample", ["image", "label"])
+
+ds = iTarDataset(..., extensions=["jpg", "cls"])
+ds.map(lambda image, label: Sample(image, int(label)))
+ds.map_tuple(train_image_aug, lambda y: y)   # still field-aligned after map
+```
+
+### Explicit arity collapse
+
+When a consumer needs a lower-arity nested structure, use
+`collapse_arity(*groups)` — a **terminal structural** step, not a field map:
+
+```python
+# 2 global + 8 local SSL views as logical jpg slots, then pack.
+n_local = 8
+ds = iTarDataset(..., extensions=["jpg"] * (2 + n_local))
+ds.map_tuple(global1, global2, *([local] * n_local))
+ds.collapse_arity(
+    [0, 1],                 # or ["jpg.0", "jpg.1"]
+    list(range(2, 2 + n_local)),
+)
+# sample becomes: ((g0, g1), (l0, ..., l7))
+```
+
+Rules:
+
+- groups form a partition of all logical fields (every field exactly once);
+- duplicates, omissions, and invalid names/indices are rejected;
+- after `collapse_arity`, further field maps are rejected;
+- name-based groups are unavailable after `add_grouping()` (use indices);
+- prefer collators when grouping is naturally a batch concern;
+  `collapse_arity` is a convenience so a custom collator is not mandatory.
+
+### SSL-style multi-view example
+
+DINO-style independent views: one physical `jpg`, many logical slots, per-slot
+functional transforms; collate packs fields for the training step:
+
+```python
+n_views = 2 + local_crops_number
+ds = iTarDataset(..., extensions=[image_ext] * n_views)
+ds.map_tuple(*view_transforms)  # length n_views
+# collate: field tuple -> {"global_crops": [...], "local_crops": [...]}
+```
+
+Do **not** use `map(lambda img: {"global_crops": ...})` to abandon field arity.
+That free-form packaging path is intentionally not part of the contract.
 
 ## Writing iTar datasets
 
@@ -118,12 +240,8 @@ Rules:
 - grouped sampling is deterministic per dataset state, epoch, and sampled index;
 - `grouping_seed` can be supplied to `add_grouping(..., grouping_seed=...)` to override internal grouped sampling seed.
 
-Repeated logical extensions are supported. For example,
-`extensions=['jpg', 'jpg', 'jpg', 'cls']` retrieves and decodes the stored
-`jpg` member once, then exposes the same decoded Python object at the three
-logical image positions before transforms run. Transforms for repeated
-positions should therefore be functional and must not mutate their inputs
-in place.
+See **Logical field model** above for repeated extensions, field maps, and
+`collapse_arity`.
 
 Sampling remains fused into `iTarDataset`: the internal physical-storage-aware
 permutation defines a global logical order, and optional distributed rank
@@ -148,10 +266,6 @@ topology keys in older state dicts are ignored).
 Stem filtering remains allowed after grouping and after transforms because
 it does not change output schema; `filter_extensions` and `add_grouping`
 remain schema-changing.
-
-Transform pipeline outputs must be a list or tuple of logical fields.
-Bare strings, dicts, and other non-sequence scalars are rejected rather
-than being expanded element-wise.
 
 Example of an invalid asymmetric template (fails fast):
 

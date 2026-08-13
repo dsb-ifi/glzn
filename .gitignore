@@ -162,7 +162,6 @@ cython_debug/
 # Drop notebooks
 *.ipynb
 
-# Drop tests (until the suite is more complete)
-tests/
+# Historical notes / local examples (not part of the package install).
 refs/
 examples/

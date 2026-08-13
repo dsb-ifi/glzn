@@ -4,7 +4,6 @@ import inspect
 import json
 import multiprocessing as mp
 import string
-from collections.abc import Mapping as ABCMapping
 from contextlib import contextmanager
 from os import PathLike
 from pathlib import Path
@@ -20,7 +19,15 @@ from .encoders import DEFAULT_DECODERS, PIL, PseudoExtension
 from .imgbrowser import browse_dataset
 from .itar.fold import iTarFold, iTarRetriever
 from .itar.utils import StemHelper, stripext
-from .maptrafo import Map, MapAll, MapGrouped, MapTuple
+from .maptrafo import (
+    ArityPreserving,
+    CollapseArity,
+    Map,
+    MapAll,
+    MapGrouped,
+    MapTuple,
+    finalize_fields,
+)
 from .sampler import IdentitySampler, MultiFeistelSampler
 
 USE_TV_TENSOR = parse_version(torchvision.__version__) >= parse_version('0.16')
@@ -47,27 +54,33 @@ def _compose(fs: Sequence[Transform]) -> _ComposeTransforms:
     return _ComposeTransforms(fs)
 
 
-def _finalize_sample(result:Any) -> tuple[Any, ...]:
-    '''Normalize transform-pipeline output to a sample field tuple.
+def logical_field_names(extensions: Sequence[str]) -> tuple[str, ...]:
+    """Stable unique names for logical extension slots (order-preserving).
 
-    Public contract: the pipeline must yield a list or tuple of logical
-    output fields. Strings, mappings, and bare scalars are rejected so they
-    are never silently expanded by ``tuple(...)``.
-    '''
-    if isinstance(result, tuple):
-        return result
-    if isinstance(result, list):
-        return tuple(result)
-    if isinstance(result, (str, bytes, bytearray)) or isinstance(result, ABCMapping):
-        raise TypeError(
-            'Transform pipeline must return a list or tuple of sample fields; '
-            f'got {type(result).__name__}.'
-        )
-    raise TypeError(
-        'Transform pipeline must return a list or tuple of sample fields; '
-        f'got {type(result).__name__}. Wrap a single field as a one-element '
-        'tuple or list, e.g. ``(value,)``.'
-    )
+    Unique extensions keep their bare name (``cls``). Repeated extensions are
+    indexed in appearance order (``jpg.0``, ``jpg.1``, …). Physical decoder
+    lookup still uses the bare extension stem.
+    """
+
+    counts: dict[str, int] = {}
+    for ext in extensions:
+        counts[ext] = counts.get(ext, 0) + 1
+    seen: dict[str, int] = {}
+    names: list[str] = []
+    for ext in extensions:
+        if counts[ext] == 1:
+            names.append(ext)
+        else:
+            idx = seen.get(ext, 0)
+            names.append(f"{ext}.{idx}")
+            seen[ext] = idx + 1
+    return tuple(names)
+
+
+def _finalize_sample(result: Any, *, expected_arity: int) -> tuple[Any, ...]:
+    """Normalize field-transform output and enforce logical arity."""
+
+    return finalize_fields(result, expected_arity)
 
 
 def _parse_decoders(
@@ -189,10 +202,10 @@ class iTarDataset(Dataset[Any]):
         self.fold.filter_extensions(self.extensions)
         self._sync_extension_state()
 
-        # Init transforms
+        # Init transforms (arity-preserving field graph until collapse_arity)
         self.transforms = []
         self._trafo = _compose(self.transforms)
-        self._logical_sample_output = False
+        self._fields_collapsed = False
 
         # Init sampling details
         self._epoch = 0
@@ -292,19 +305,24 @@ class iTarDataset(Dataset[Any]):
         return self
 
     def _add_field_trafo(self, trafo:Transform, caller:str) -> 'iTarDataset':
-        if self._logical_sample_output:
+        if self._fields_collapsed:
             raise RuntimeError(
-                f'{caller} cannot be attached after map(), because map() '
-                'produces one logical sample object rather than field-aligned '
-                'sample outputs.'
+                f'{caller} cannot be attached after collapse_arity(); '
+                'field-aligned maps require the original logical field arity.'
             )
-        return self._add_trafo(trafo)
+        # Check arity after every field map so composition cannot drift.
+        return self._add_trafo(
+            ArityPreserving(trafo, self._expected_output_arity())
+        )
 
     def _finalize_transform_output(self, result:Any) -> Any:
-        if self._logical_sample_output:
+        if self._fields_collapsed:
+            # Structural collapse is terminal; do not re-impose field arity.
             return result
-        return _finalize_sample(result)
-    
+        return _finalize_sample(
+            result, expected_arity=self._expected_output_arity()
+        )
+
     def _sync_extension_state(self):
         """Resync all extension-derived metadata from self.extensions and fold state."""
         self._real_ext = {e for e in self.extensions if e not in _valid_pseudo_extensions}
@@ -314,6 +332,10 @@ class iTarDataset(Dataset[Any]):
             raise ValueError('At least one real extension must be provided!')
         self._extmap = {v: k for k, v in self.fold.state.ext2id.items()}
         self.decoders = _parse_decoders(self.fold)
+        self._logical_field_names = logical_field_names(self.extensions)
+        self._logical_name_to_index = {
+            name: i for i, name in enumerate(self._logical_field_names)
+        }
         self._validate_contiguous_row_groups('_sync_extension_state()')
 
     def _refresh_bucketsize(self):
@@ -349,6 +371,63 @@ class iTarDataset(Dataset[Any]):
         if self._grouping_active and self.grouping is not None:
             return len(self.grouping)
         return len(self.extensions)
+
+    @property
+    def logical_field_names(self) -> tuple[str, ...]:
+        """Stable unique names for the configured ``extensions`` schema.
+
+        These names do **not** rewrite under ``add_grouping()``. Name-based
+        ``collapse_arity`` is rejected while grouping is active; use indices.
+        """
+
+        return self._logical_field_names
+
+    def _resolve_field_refs(
+        self,
+        refs: Sequence[int | str],
+        *,
+        caller: str,
+    ) -> tuple[int, ...]:
+        """Resolve positional indices and/or logical field names to indices.
+
+        Name-based refs are only valid when output arity matches the extension
+        schema. After ``add_grouping()``, effective arity follows the grouping
+        template, which may differ from ``extensions`` / ``logical_field_names``;
+        use positional indices in that mode.
+        """
+
+        if len(refs) == 0:
+            raise ValueError(f'{caller} requires at least one field reference.')
+        resolved: list[int] = []
+        for ref in refs:
+            if isinstance(ref, bool):
+                raise TypeError(
+                    f'{caller} field refs must be int indices or str names; '
+                    f'got {type(ref).__name__}.'
+                )
+            if isinstance(ref, int):
+                resolved.append(ref)
+                continue
+            if isinstance(ref, str):
+                if self._grouping_active:
+                    raise RuntimeError(
+                        f'{caller}: name-based field refs are unavailable after '
+                        'add_grouping(); logical_field_names describe the extension '
+                        'schema, not the grouping template. Use positional indices.'
+                    )
+                if ref not in self._logical_name_to_index:
+                    valid = ', '.join(self._logical_field_names)
+                    raise KeyError(
+                        f'{caller}: unknown logical field name {ref!r}. '
+                        f'Valid names: {valid}.'
+                    )
+                resolved.append(self._logical_name_to_index[ref])
+                continue
+            raise TypeError(
+                f'{caller} field refs must be int indices or str names; '
+                f'got {type(ref).__name__}.'
+            )
+        return self._validate_transform_indices(resolved, caller)
 
     def _validate_transform_indices(self, indices:Sequence[int], caller:str) -> tuple[int,...]:
         clean = tuple(indices)
@@ -838,146 +917,78 @@ class iTarDataset(Dataset[Any]):
         return out
 
     def map(self, mapping:Transform) -> "iTarDataset":
-        '''Takes a mapping and applies it to the tuple of extensions.
+        """Joint arity-preserving map over all logical fields.
 
-        For `mapping = f` and `extensions = ['jpg', 'cls'], this will return
-        the logical sample object produced by ``f(<sample>.jpg, <sample>.cls)``.
+        For ``mapping = f`` and logical arity ``N``::
 
-        ``map()`` is the boundary where archive-field tuple arity stops being
-        semantically meaningful. The mapping may return any picklable Python
-        object accepted by the downstream DataLoader/collate path. Use
-        ``map_tuple()``, ``map_group()``, or ``map_all()`` for field-aligned
-        transforms that preserve sample-field tuple semantics.
+            f(field_0, ..., field_{N-1}) -> N fields
 
-        Parameters
-        ----------
-        mapping : Callable
-            Callable to be applied to the tuple of extensions.
-
-        Returns
-        -------
-        iTarDataset
-            Updated dataset with added transformations.
-        '''
+        The result must be a list/tuple (namedtuple allowed) of length ``N``.
+        Field-aligned maps compose freely with ``map``; none of them change
+        logical arity. Use :meth:`collapse_arity` only when a deliberate
+        structural arity change is required.
+        """
         if not callable(mapping):
             raise TypeError("Provided mapping is not callable.")
-        if self._logical_sample_output:
-            raise RuntimeError(
-                'map() cannot be attached after map(), because map() has '
-                'already produced one logical sample object. A second map() '
-                'is not currently supported.'
-            )
 
         sig = inspect.signature(mapping)
         params = [
             p for p in sig.parameters.values()
             if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)
         ]
-        n_expected = self._expected_output_arity()
         n_actual = len(params)
-
         has_varargs = any(p.kind == p.VAR_POSITIONAL for p in sig.parameters.values())
+        n_expected = self._expected_output_arity()
         if not has_varargs and n_actual != n_expected:
             raise TypeError(
-                f"Mapping function for map() must accept {n_expected} positional arguments, "
-                f"but got {n_actual}."
+                f"Mapping function for map() must accept {n_expected} positional "
+                f"arguments (logical field arity), but got {n_actual}."
             )
-        self._logical_sample_output = True
-        return self._add_trafo(Map(mapping))
+        return self._add_field_trafo(Map(mapping), 'map()')
 
     def map_all(self, mapping:Transform) -> "iTarDataset":
-        '''Takes a mapping and applies it to all extensions.
+        """Apply one callable to every logical field (arity-preserving).
 
-        For `mapping = f` and `extensions = ['jpg', 'cls'], this will return
-        the tuple `(f(<sample>.jpg), f(<sample>.cls))`.
+        For ``mapping = f`` and ``extensions = ['jpg', 'cls']``::
 
-        Parameters
-        ----------
-        mapping : Callable
-            Callable to be applied to all extensions.
-
-        Returns
-        -------
-        iTarDataset
-            Updated dataset with added transformations.
-        '''
+            (f(jpg), f(cls))
+        """
         if not callable(mapping):
             raise TypeError("Provided mapping is not callable.")
-        if self._logical_sample_output:
-            raise RuntimeError(
-                'map_all() cannot be attached after map(), because map() '
-                'produces one logical sample object rather than field-aligned '
-                'sample outputs.'
-            )
         return self._add_field_trafo(MapAll(mapping), 'map_all()')
 
     def map_group(self, mapping:Transform, indices:Sequence[int]) -> "iTarDataset":
-        '''Takes a mapping and applies it to specific indices of extensions.
+        """Apply a joint map to selected logical field indices.
 
-        For `mapping = f`, `extensions = ['jpg', 'cls'], and `indices = (0,)` this
-        will return the tuple `f(<sample>.jpg), <sample>.cls`.
+        For ``mapping = f``, ``extensions = ['jpg', 'cls']``, and
+        ``indices = (0,)``::
 
-        Parameters
-        ----------
-        mapping : Callable
-            Callable to be applied to the tuple of extensions.
-        indices : Sequence[int]
-            Indices for which to apply the mapping.
+            (f(jpg), cls)
 
-        Returns
-        -------
-        iTarDataset
-            Updated dataset with added transformations.
-        '''
+        ``f`` must return as many outputs as ``indices`` has entries.
+        """
         if not callable(mapping):
             raise TypeError("Provided mapping is not callable.")
-        if self._logical_sample_output:
-            raise RuntimeError(
-                'map_group() cannot be attached after map(), because map() '
-                'produces one logical sample object rather than field-aligned '
-                'sample outputs.'
-            )
         return self._add_field_trafo(
-            MapGrouped(mapping, self._validate_transform_indices(indices, 'map_group()')),
+            MapGrouped(
+                mapping,
+                self._validate_transform_indices(indices, 'map_group()'),
+            ),
             'map_group()',
         )
 
     def map_tuple(self, *maps:Transform) -> "iTarDataset":
-        """Applies given mappings to individual extensions of dataset items.
+        """Apply one callable per logical field (arity-preserving).
 
-        For `maps = [f1, f2]` and `extensions = ['jpg', 'cls']`, this will return
-        the tuple `(f1(<sample>.jpg), f2(<sample>.cls))`.
+        For ``maps = (f1, f2)`` and ``extensions = ['jpg', 'cls']``::
 
-        NOTE: Certain extensions such as pseudo extensions and class labels
-              do not require explicit transforms in order for map_tuple to function
-              correctly. In other words, map_tuple can handle the case where
-              `maps = [f1]` and `extensions = ['jpg', 'cls']`. This avoids tedious
-              constructions where class labels and potential pseudo extensions require
-              explicit mappings for the transformations to parse correctly.
+            (f1(jpg), f2(cls))
 
-              Another example is useful for clarity:
-              A case with `maps = [f1, f2]` and `extensions = ['jpg', 'seg16', '_name']`
-              would work, since '_name' is a pseudoextension, and doesn't require an
-              explicit mapping to infer intended behaviour.
-
-        Parameters
-        ----------
-        maps : tuple[Callable, ...]
-            Tuple of callables for mapping individual extensions.
-
-        Returns
-        -------
-        iTarDataset
-            Updated dataset with added transformations.
+        The number of callables must equal the logical field arity
+        (``len(extensions)``, or grouping template length when grouped).
         """
         if not all(callable(m) for m in maps):
             raise TypeError("One or more mapping is not callable.")
-        if self._logical_sample_output:
-            raise RuntimeError(
-                'map_tuple() cannot be attached after map(), because map() '
-                'produces one logical sample object rather than field-aligned '
-                'sample outputs.'
-            )
         num_ext = self._expected_output_arity()
         if len(maps) != num_ext:
             raise ValueError(
@@ -985,6 +996,68 @@ class iTarDataset(Dataset[Any]):
                 f"Expected {num_ext}, got {len(maps)}."
             )
         return self._add_field_trafo(MapTuple(maps), 'map_tuple()')
+
+    def collapse_arity(self, *groups: Sequence[int | str]) -> "iTarDataset":
+        """Explicit structural arity change: group logical fields into nests.
+
+        Each ``group`` is an ordered sequence of field indices and/or logical
+        field names (see :attr:`logical_field_names`). Groups form a partition
+        of all logical fields: every field appears exactly once, no duplicates.
+
+        Example (DINO-style packing of 2 globals + 8 locals)::
+
+            ds.collapse_arity(
+                [0, 1],                 # or ["jpg.0", "jpg.1"]
+                list(range(2, 10)),     # remaining local slots
+            )
+            # sample becomes: ((g0, g1), (l0, ..., l7))
+
+        This is **not** a field map. After ``collapse_arity``, further
+        ``map`` / ``map_tuple`` / ``map_all`` / ``map_group`` calls are
+        rejected. Prefer collators when grouping is naturally a batch concern.
+
+        Name-based groups are supported only when the output schema is still the
+        extension list. After ``add_grouping()``, use positional indices only
+        (``logical_field_names`` do not describe the grouping template).
+        """
+        if self._fields_collapsed:
+            raise RuntimeError('collapse_arity() can only be applied once.')
+        if len(groups) == 0:
+            raise ValueError('collapse_arity() requires at least one group.')
+
+        arity = self._expected_output_arity()
+        resolved_groups: list[tuple[int, ...]] = []
+        seen: set[int] = set()
+        for gi, group in enumerate(groups):
+            if not isinstance(group, Sequence) or isinstance(group, (str, bytes)):
+                raise TypeError(
+                    f'collapse_arity group {gi} must be a sequence of int/str '
+                    f'field refs; got {type(group).__name__}.'
+                )
+            idxs = self._resolve_field_refs(group, caller=f'collapse_arity group {gi}')
+            for i in idxs:
+                if i in seen:
+                    raise ValueError(
+                        f'collapse_arity: duplicate field index {i} across groups.'
+                    )
+                seen.add(i)
+            resolved_groups.append(idxs)
+
+        missing = [i for i in range(arity) if i not in seen]
+        if missing:
+            raise ValueError(
+                'collapse_arity: every logical field must appear exactly once; '
+                f'missing indices {missing}.'
+            )
+        if len(seen) != arity:
+            raise ValueError(
+                'collapse_arity: internal partition error '
+                f'(seen={len(seen)}, arity={arity}).'
+            )
+
+        self._add_trafo(CollapseArity(resolved_groups))
+        self._fields_collapsed = True
+        return self
 
     def set_distributed(
         self,
