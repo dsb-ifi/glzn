@@ -249,6 +249,20 @@ with proc.batch(phase=Phase.TRAIN) as b:
 
 ---
 
+## Inspecting existing runs
+
+Use the Python environment with GLZN installed to summarize existing run logs.
+
+```sh
+python -m glzn.log /path/to/runs --window 100
+```
+
+Pass a log file directly or a directory to search for `metrics.jsonl`. Each row shows the latest epoch and successful update count, the age of the last record, and recent update rate, AMP skips, and nonfinite values. The recent counts use up to `--window` complete lines per file. If a resumed run rolls back to an earlier update, the counts and rate use the sequence after that rollback.
+
+A partial last line stays out of the summary until its newline arrives. The age column measures time since the last logged update attempt, which can include time spent in validation or checkpointing.
+
+---
+
 ## Processor emission rules
 
 - Capture `update_attempted = is_update_step` **before** `on_update` / `next_micro`.

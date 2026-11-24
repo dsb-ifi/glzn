@@ -14,6 +14,7 @@ maintaining high IO in sequential reads while allowing for fast random access wh
   Sampling strategies for train/eval iteration.
 - `encoders.py`  
   Target/value encoders used in data pipelines.
+- `seismic.py` reads training windows from SGZ survey cubes.
 - `maptrafo.py`  
   Mapping/transform helpers applied to dataset outputs.
 - `itar/`  
@@ -297,6 +298,78 @@ ds.add_grouping(['{0}.jpg', '{0}.npy', '{1}.jpg', '{1}.seg16'])
 ```
 
 The template above is rejected because slot `0` requires `{jpg, npy}` while slot `1` requires `{jpg, seg16}`.
+
+## Optional data formats
+
+### Compressed NumPy arrays
+
+From the checkout, install `python -m pip install '.[blosc2]'`. Write a numeric or boolean NumPy array under `b2nd` to store it using Zstd and bitshuffle. The frame records its dtype and shape, so an optical-flow field or a seismic tile comes back as the same array.
+
+```python
+import numpy as np
+from glzn.data.dataset import iTarDataset
+from glzn.data.writer import iTarDatasetWriter
+
+tile = np.arange(128 * 128, dtype=np.float32).reshape(128, 128)
+with iTarDatasetWriter('tiles', '/data', folds=['train']) as writer:
+    writer.fold('train').write('tile01', {'b2nd': tile})
+
+ds = iTarDataset('tiles', '/data', fold='train', extensions=['b2nd'])
+(tile,) = ds[0]
+```
+
+### Lossless HTJ2K images
+
+Install `python -m pip install '.[htj2k]'` and pass `override_encoders=[('b2nd', HTJ2K.encoder())]` to the writer, with `HTJ2K` imported from `glzn.data.encoders`. Use a `uint8` or `uint16` image of shape `(H, W)` or `(H, W, C)`, where `C` is 1 or 3. The same `b2nd` decoder reads Zstd and HTJ2K frames. HTJ2K preserves pixel values and shape and returns an array with native byte order.
+
+Activate the environment containing the HTJ2K plugin. Blosc2 can invoke its Python interpreter to locate the codec library when the system loader cannot find it directly.
+
+### JPEG XL photos
+
+Install `python -m pip install '.[jxl]'`. Write an L, RGB or RGBA Pillow image under `jxl` to encode its pixels losslessly. To recompress an existing JPEG, pass the original JPEG bytes as the `jxl` field value. The default iTar decoder gives you an RGB Pillow image, and the gallery accepts `img_ext='jxl'`. To read the original JPEG bytes back from a recompressed shard, pass `override_decoders=[('jxl', JXL.restore_jpeg)]` to the dataset, with `JXL` imported from `glzn.data.encoders`.
+
+### MP4 clips
+
+Install `python -m pip install '.[video]'` and [FFmpeg shared libraries compatible with TorchCodec](https://github.com/meta-pytorch/torchcodec#installing-torchcodec). Write existing MP4 bytes under `mp4`, or configure the writer to encode RGB `torch.uint8` frames of shape `(T, 3, H, W)` with an explicit frame rate.
+
+```python
+from glzn.data.dataset import iTarDataset
+from glzn.data.encoders import MP4
+from glzn.data.writer import iTarDatasetWriter
+
+with iTarDatasetWriter(
+    'clips', '/data', folds=['train'],
+    override_encoders=[('mp4', MP4('encode', frame_rate=24))],
+) as writer:
+    writer.fold('train').write('clip01', {'mp4': frames})
+
+ds = iTarDataset(
+    'clips', '/data', fold='train', extensions=['mp4'],
+    override_decoders=[('mp4', MP4('decode', frame_indices=[0, 2, 4]))],
+)
+(video,) = ds[0]
+```
+
+Each member holds one clip. The decoder returns a `torchvision.tv_tensors.Video` on CPU and reads all video frames by default. Set `frame_indices` to decode only the specified frames in order. The shard reader still fetches the encoded member in full.
+
+### Seismic survey windows
+
+Install `python -m pip install '.[seismic]'` to read 3D post-stack SGZ cubes with Equinor's [`seismic-zfp`](https://github.com/equinor/seismic-zfp). Each `SgzWindow` describes a crop using zero-based array indices in `(inline, crossline, sample)` order. The reader seeks to the blocks covering that crop and returns the decoded `float32` amplitudes.
+
+```python
+from torch.utils.data import DataLoader
+from glzn.data.seismic import SgzDataset, SgzWindow
+
+ds = SgzDataset([
+    SgzWindow('/data/survey.sgz', origin=(10, 20, 128), shape=(16, 16, 64)),
+    SgzWindow('/data/survey.sgz', origin=(26, 20, 128), shape=(16, 16, 64)),
+])
+for batch in DataLoader(ds, batch_size=2):
+    print(batch.shape)
+ds.close()
+```
+
+Each DataLoader worker opens its own reader and keeps its most recently used cube open. For automatic batching, use windows of the same shape.
 
 ## Browsing samples
 

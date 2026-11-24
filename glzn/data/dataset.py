@@ -7,7 +7,7 @@ import string
 from contextlib import contextmanager
 from os import PathLike
 from pathlib import Path
-from typing import Any, Callable, Literal, Mapping, Sequence
+from typing import Any, Callable, Iterable, Literal, Mapping, Sequence
 
 import numpy as np
 import torchvision
@@ -120,6 +120,9 @@ class _BrowserWrapper:
         supported = PIL.decoder().supported_extensions
         ext_source = supported.keys() if isinstance(supported, dict) else (supported or [])
         valid_pil_ext = {stripext(ext).lower() for ext in ext_source}
+        valid_pil_ext.update(
+            ext for ext, decoder in DEFAULT_DECODERS.items() if isinstance(decoder, PIL)
+        )
         if self.img_ext not in valid_pil_ext:
             curext = ', '.join(sorted(valid_pil_ext))
             raise ValueError(
@@ -248,6 +251,7 @@ class iTarDataset(Dataset[Any]):
         *,
         jpeg_as_tensor:bool=False,
         mask_as_tensor:bool=False,
+        override_decoders:Iterable[tuple[str,Decoder]]|None=None,
         **kwargs
     ):
         kw = {'verbose':True, 'enforce_contiguous':enforce_contiguous}
@@ -274,6 +278,9 @@ class iTarDataset(Dataset[Any]):
         # Init valid extensions
         self._jpeg_as_tensor = jpeg_as_tensor
         self._mask_as_tensor = mask_as_tensor
+        self._override_decoders = {
+            stripext(ext).lower(): decoder for ext, decoder in (override_decoders or ())
+        }
         self._val_ext = list(self.fold.state.ext2id.keys())
         if extensions is None:
             extensions = self._val_ext
@@ -410,11 +417,12 @@ class iTarDataset(Dataset[Any]):
         if self._nrealext == 0:
             raise ValueError('At least one real extension must be provided!')
         self._extmap = {v: k for k, v in self.fold.state.ext2id.items()}
-        overrides = {}
+        overrides:dict[str,Decoder] = {}
         if self._jpeg_as_tensor:
             overrides.update(_JPEG_TENSOR_DECODERS)
         if self._mask_as_tensor:
             overrides.update(_MASK_TENSOR_DECODERS)
+        overrides.update(self._override_decoders)
         self.decoders = _parse_decoders(self.fold, overrides)
         self._logical_field_names = logical_field_names(self.extensions)
         self._logical_name_to_index = {

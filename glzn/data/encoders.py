@@ -5,8 +5,11 @@ import scipy.io as spio
 import pickle
 import torch
 
+from functools import cache
+from importlib import import_module
 from io import BytesIO
-from typing import List, Dict, Union, Set, Optional
+from types import ModuleType
+from typing import Dict, List, Optional, Sequence, Set, Union
 from PIL import Image
 from torchvision import tv_tensors
 from torchvision.io import ImageReadMode, decode_jpeg
@@ -1063,6 +1066,174 @@ class TXT(EncoderDecoder):
         return data.decode('utf-8')
 
 
+@cache
+def _optional_codec(module:str, extra:str) -> ModuleType:
+    try:
+        return import_module(module)
+    except ModuleNotFoundError as exc:
+        if exc.name != module:
+            raise
+        raise ImportError(f'Install GLZN with the {extra} extra to use {module}.') from exc
+
+
+@cache
+def _load_htj2k() -> int:
+    plugin = _optional_codec('blosc2_htj2k', 'htj2k')
+    plugin.register_codec()
+    return plugin.CODEC_ID
+
+
+class B2ND(EncoderDecoder):
+
+    '''Lossless NumPy arrays in Blosc2 NDArray frames.
+
+    Encoding uses Zstd with bitshuffle for numeric and boolean arrays.
+    Decoding also supports HTJ2K frames when the plugin is installed.
+    '''
+
+    def __init__(self, mode:str):
+        super().__init__(mode, True)
+        self.supported_extensions = {'.b2nd': 'Compressed Blosc2 array'}
+        self._default_tv = 'other'
+
+    def _encode(self, obj:np.ndarray) -> bytes:
+        array = np.asarray(obj)
+        if array.dtype.kind not in 'buifc':
+            raise TypeError('Blosc2 arrays must have a numeric or boolean dtype.')
+        blosc2 = _optional_codec('blosc2', 'blosc2')
+        cparams = {
+            'codec': blosc2.Codec.ZSTD,
+            'filters': [blosc2.Filter.BITSHUFFLE],
+            'nthreads': 1,
+        }
+        return blosc2.asarray(array, cparams=cparams).to_cframe()
+
+    def _decode(self, data:bytes) -> np.ndarray:
+        blosc2 = _optional_codec('blosc2', 'blosc2')
+        array = blosc2.ndarray_from_cframe(data)
+        if array.schunk.cparams.codec == blosc2.Codec.HTJ2K:
+            _load_htj2k()
+        return array[...]
+
+
+class HTJ2K(B2ND):
+
+    '''Lossless HTJ2K images in Blosc2 NDArray frames.
+
+    The encoder accepts nonempty uint8 or uint16 arrays in (H, W) or
+    (H, W, C) order, with one or three channels. The decoder returns
+    a NumPy array with native byte order for HTJ2K images.
+    '''
+
+    def __init__(self, mode:str):
+        super().__init__(mode)
+        self.supported_extensions = {'.b2nd': 'Lossless Blosc2 HTJ2K image'}
+        self._default_tv = 'image'
+
+    def _encode(self, obj:np.ndarray) -> bytes:
+        image = np.asarray(obj)
+        if image.dtype.kind != 'u' or image.dtype.itemsize not in (1, 2):
+            raise TypeError('HTJ2K images must have uint8 or uint16 dtype.')
+        if image.ndim not in (2, 3) or image.size == 0:
+            raise ValueError('HTJ2K images must be nonempty HW or HWC arrays.')
+        if image.ndim == 3 and image.shape[-1] not in (1, 3):
+            raise ValueError('HTJ2K images must have one or three channels.')
+
+        image = np.ascontiguousarray(image, dtype=image.dtype.newbyteorder('='))
+        blosc2 = _optional_codec('blosc2', 'htj2k')
+        cparams = {
+            'codec': _load_htj2k(),
+            'codec_meta': 0,
+            'filters': [],
+            'splitmode': blosc2.SplitMode.NEVER_SPLIT,
+            'nthreads': 1,
+        }
+        return blosc2.asarray(
+            image, chunks=image.shape, blocks=image.shape, cparams=cparams,
+        ).to_cframe()
+
+
+class JXL(PIL):
+
+    '''JPEG XL images or reversible transcodes of original JPEG bytes.
+
+    Parameters
+    ----------
+    mode : str
+        Either 'encode' or 'decode'.
+    convert_to : str or None, default 'RGB'
+        Pillow mode for decoded images. Use None to keep the decoded mode.
+    '''
+
+    def __init__(self, mode:str, convert_to:str|None='RGB'):
+        super().__init__(mode, convert_to)
+        self.supported_extensions = {'.jxl': 'JPEG XL image'}
+
+    def _encode(self, obj:Image.Image|bytes) -> bytes:
+        codec = _optional_codec('pyjpegxl', 'jxl')
+        if isinstance(obj, bytes):
+            return codec.jpeg_to_jxl(obj)
+        if obj.mode not in {'L', 'RGB', 'RGBA'}:
+            raise ValueError('JPEG XL encoding requires an L, RGB or RGBA Pillow image.')
+        pixels, metadata = import_module('pyjpegxl.pillow').from_pil(obj)
+        return codec.encode_from_numpy(pixels, lossless=True, **metadata)
+
+    def _decode(self, data:bytes) -> Image.Image:
+        codec = _optional_codec('pyjpegxl', 'jxl')
+        metadata, pixels = codec.decode_to_numpy(data, dtype='uint8')
+        image = import_module('pyjpegxl.pillow').to_pil(pixels, metadata)
+        return image.convert(self.convert_to) if self.convert_to is not None else image
+
+    @staticmethod
+    def restore_jpeg(data:bytes) -> bytes:
+        '''Recover the original JPEG from a reversible JPEG XL transcode.'''
+        return _optional_codec('pyjpegxl', 'jxl').jxl_to_jpeg(data)
+
+
+class MP4(EncoderDecoder):
+
+    '''Short MP4 clips as uint8 RGB video tensors in (T, C, H, W) order.
+
+    Parameters
+    ----------
+    mode : str
+        Either 'encode' or 'decode'.
+    frame_rate : float or None, optional
+        Frames per second when encoding a tensor. Existing MP4 bytes pass through.
+    frame_indices : sequence of int or None, optional
+        Frames to decode, in the requested order. None reads the whole clip.
+    '''
+
+    def __init__(
+        self, mode:str, *, frame_rate:float|None=None,
+        frame_indices:Sequence[int]|None=None,
+    ):
+        super().__init__(mode)
+        self.supported_extensions = {'.mp4': 'MP4 video clip'}
+        self.frame_rate = frame_rate
+        self.frame_indices = None if frame_indices is None else tuple(frame_indices)
+
+    def _encode(self, obj:torch.Tensor|bytes) -> bytes:
+        if isinstance(obj, bytes):
+            return obj
+        if self.frame_rate is None:
+            raise ValueError('Set frame_rate when encoding a video tensor to MP4.')
+        codec = _optional_codec('torchcodec', 'video')
+        with BytesIO() as output:
+            encoder = codec.encoders.VideoEncoder(obj, frame_rate=self.frame_rate)
+            encoder.to_file_like(output, 'mp4')
+            return output.getvalue()
+
+    def _decode(self, data:bytes) -> tv_tensors.Video:
+        codec = _optional_codec('torchcodec', 'video')
+        decoder = codec.decoders.VideoDecoder(data, device='cpu')
+        if self.frame_indices is None:
+            frames = decoder[:]
+        else:
+            frames = decoder.get_frames_at(indices=self.frame_indices).data
+        return tv_tensors.Video(frames)
+
+
 # Define default encoders
 
 _default_decoder_list = [
@@ -1079,6 +1250,9 @@ _default_decoder_list = [
     MAT.decoder(),
     PKL.decoder(),
     TXT.decoder(),
+    B2ND.decoder(),
+    JXL.decoder(),
+    MP4.decoder(),
 ]
 
 _default_encoder_list = [
@@ -1094,6 +1268,9 @@ _default_encoder_list = [
     MAT.encoder(),
     PKL.encoder(),
     TXT.encoder(),
+    B2ND.encoder(),
+    JXL.encoder(),
+    MP4.encoder(),
 ]
 
 DEFAULT_DECODERS = {

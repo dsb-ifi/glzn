@@ -49,11 +49,12 @@ Planned submodules:
     - [X] Improved extension filtering.
     - [X] Low overhead stateful sampling capability.
     - [ ] Add-ons (low priority):
-        - [ ] Add optional encoders.
-            - [ ] blosc2-openhtj2k.
-            - [ ] pillow-jxl-plugin.
-            - [ ] Additional video codecs.
-            - [ ] Seismic data support.
+        - [X] Add optional encoders and readers ([usage](glzn/data/README.md#optional-data-formats)).
+            - [X] Lossless NumPy arrays via Blosc2 and Zstd.
+            - [X] HTJ2K via the optional `blosc2-htj2k` plugin.
+            - [X] JPEG XL with reversible JPEG transcoding.
+            - [X] Short MP4 clips via TorchCodec.
+            - [X] Seismic windows via Equinor's `seismic-zfp`.
         - [ ] Add encoder based grouping format.
         - [ ] Collator factory with support for NamedTuple or dict from Dataloader.
 - [ ] `aug` submodule for augmentations.
@@ -80,7 +81,7 @@ Planned submodules:
     - [X] Basic logging support.
     - [ ] Add-ons (medium priority):
         - [ ] Add Aim support.
-        - [ ] W&B support (low priority, locks users into pay-to-use)
+        - [ ] W&B support.
 - [ ] `optim` module with commonly used optimizers not covered by PyTorch.
     - [ ] cAdamW, StableAdamW, cStableAdamW.
     - [ ] LAMB, cLAMB.
