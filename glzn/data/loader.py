@@ -45,12 +45,15 @@ def build_dataloader(
 
 
 def move_to_device(
-    value: object,
-    device: torch.device | str,
+    value:object,
+    device:torch.device|str,
     *,
-    non_blocking: bool,
+    non_blocking:bool,
 ) -> object:
-    """Recursively move tensor leaves while preserving common containers."""
+    """Move tensor leaves within mappings, lists, tuples, and named tuples.
+
+    Mappings become dicts. Named tuples retain their type.
+    """
 
     if isinstance(value, Tensor):
         return value.to(device, non_blocking=non_blocking)
@@ -60,10 +63,14 @@ def move_to_device(
             for key, item in value.items()
         }
     if isinstance(value, tuple):
-        return tuple(
+        items = tuple(
             move_to_device(item, device, non_blocking=non_blocking)
             for item in value
         )
+        make_namedtuple = getattr(value, '_make', None)
+        if callable(make_namedtuple):
+            return make_namedtuple(items)
+        return items
     if isinstance(value, list):
         return [
             move_to_device(item, device, non_blocking=non_blocking)

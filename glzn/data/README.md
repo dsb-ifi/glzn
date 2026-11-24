@@ -165,6 +165,32 @@ ds.map_tuple(*view_transforms)  # length n_views
 Do **not** use `map(lambda img: {"global_crops": ...})` to abandon field arity.
 That free-form packaging path is intentionally not part of the contract.
 
+### Named batches
+
+If your iTar dataset `ds` yields an image tensor and an integer label, you can give the fields names at collation. Once your transforms give every image the same shape, let PyTorch stack the fields and wrap the result in a `NamedTuple`.
+
+```python
+from typing import NamedTuple
+
+from torch import Tensor
+from torch.utils.data import DataLoader, default_collate
+
+
+class ClassificationBatch(NamedTuple):
+    images:Tensor
+    labels:Tensor
+
+
+def collate_classification(samples:list[tuple[Tensor, int]]) -> ClassificationBatch:
+    images, labels = default_collate(samples)
+    return ClassificationBatch(images, labels)
+
+
+loader = DataLoader(ds, batch_size=32, collate_fn=collate_classification)
+```
+
+GLZN's `move_to_device()` moves the tensors while preserving the named tuple, so the training step can still access `batch.images` and `batch.labels`. A collator can also return a dict if the training step expects keys.
+
 ## Paired images and masks
 
 Use `jpeg_as_tensor=True` and `mask_as_tensor=True` to get a torchvision `Image` and `Mask` from iTar. The `seg8`, `seg16`, `seg24`, and `seg32` decoders return `torch.int64` masks in this mode. Pass both fields to one `map_group()` call so the image and mask get the same crop and flip. Apply color transforms to the image field on its own.

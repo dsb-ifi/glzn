@@ -55,8 +55,8 @@ Planned submodules:
             - [X] JPEG XL with reversible JPEG transcoding.
             - [X] Short MP4 clips via TorchCodec.
             - [X] Seismic windows via Equinor's `seismic-zfp`.
-        - [ ] Add encoder based grouping format.
-        - [ ] Collator factory with support for NamedTuple or dict from Dataloader.
+        - [ ] Support alternate encodings for one logical field. An image field could accept `.jpg` or `.jxl`, with exactly one present per sample.
+        - [X] Preserve named batches during device transfer ([example](glzn/data/README.md#named-batches)).
 - [ ] `aug` submodule for augmentations.
     - [ ] Standard ViT Augmentations.
     - [ ] DEIT3 Augmentations.
