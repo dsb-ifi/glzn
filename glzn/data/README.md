@@ -164,6 +164,27 @@ ds.map_tuple(*view_transforms)  # length n_views
 Do **not** use `map(lambda img: {"global_crops": ...})` to abandon field arity.
 That free-form packaging path is intentionally not part of the contract.
 
+## Paired images and masks
+
+Use `jpeg_as_tensor=True` and `mask_as_tensor=True` to get a torchvision `Image` and `Mask` from iTar. The `seg8`, `seg16`, `seg24`, and `seg32` decoders return `torch.int64` masks in this mode. Pass both fields to one `map_group()` call so the image and mask get the same crop and flip. Apply color transforms to the image field on its own.
+
+```python
+from torchvision.transforms import v2
+from glzn.data.dataset import iTarDataset
+
+ds = iTarDataset(
+    'my_dataset', '/data', fold='train', extensions=['jpg', 'seg8'],
+    jpeg_as_tensor=True, mask_as_tensor=True,
+)
+geometry = v2.Compose([v2.RandomCrop((224, 224)), v2.RandomHorizontalFlip()])
+ds.map_group(geometry, indices=[0, 1])
+ds.browse(mask_ext='seg8', cols=3, width=320)
+```
+
+The gallery puts the stored overlay on the left and the transformed overlay on the right. Class ID zero is transparent. Browse image tensors before normalization to see their colors in the display range. For stored overlays from the command line, pass `--mask-ext seg8` to the browser module.
+
+Crops and flips preserve the original class IDs. Torchvision resize can cast integer masks through `float32`, which can round IDs above `2**24`. Choose integer-preserving geometry when using wide IDs.
+
 ## Writing iTar datasets
 
 Use `glzn.data.writer.iTarDatasetWriter` to create sharded tar files and binary

@@ -15,7 +15,9 @@ import xxhash
 from packaging.version import parse as parse_version
 from torch.utils.data import Dataset
 
-from .encoders import DEFAULT_DECODERS, PIL, PseudoExtension, decode_jpeg_tensor
+from .encoders import (
+    DEFAULT_DECODERS, PIL, PseudoExtension, _MaskTensorDecoder, decode_jpeg_tensor,
+)
 from .itar.fold import iTarFold, iTarRetriever
 from .itar.utils import StemHelper, stripext
 from .maptrafo import (
@@ -36,6 +38,10 @@ Decoder = Callable[[bytes], Any]
 _JPEG_TENSOR_DECODERS: dict[str, Decoder] = dict.fromkeys(
     ('jfif', 'jpe', 'jpeg', 'jpg'), decode_jpeg_tensor
 )
+_MASK_TENSOR_DECODERS: dict[str, Decoder] = {
+    ext: _MaskTensorDecoder(DEFAULT_DECODERS[ext])
+    for ext in ('seg8', 'seg16', 'seg24', 'seg32')
+}
 _VALIDATION_CHUNK_SIZE = 1 << 16
 
 
@@ -103,7 +109,8 @@ class _BrowserWrapper:
 
     def __init__(
         self, dataset:iTarDataset, img_ext:str='jpg', lab_ext:str='cls',
-        labeldict:Mapping[Any,Any]|None=None
+        labeldict:Mapping[Any,Any]|None=None, *,
+        mask_ext:str|None=None, width:int=128,
     ):
         self.dataset = dataset
         self.img_ext = stripext(img_ext).lower()
@@ -136,22 +143,53 @@ class _BrowserWrapper:
                 f'Valid current extensions are: {curext}.'
             )
 
+        self._maskindex = None
+        self._preview_width = width
+        if mask_ext is not None:
+            mask_ext = stripext(mask_ext).lower()
+            if mask_ext not in dataset.extensions:
+                raise ValueError(f'Mask extension {mask_ext!r} is not in the dataset fields.')
+            if dataset._grouping_active or dataset._fields_collapsed:
+                raise ValueError('Mask overlays require ordinary fields without grouping or arity collapse.')
+            self._maskindex = dataset.extensions.index(mask_ext)
+
     def __len__(self):
         return len(self.dataset)
 
-    def __getitem__(self, i):
-        sample = self.dataset[i]
+    def _read_preview(self, i:int) -> tuple[Any,Sequence[Any],int|None]:
+        if self._maskindex is None:
+            sample = self.dataset[i]
+            return sample[self._imgindex], sample, None
+
+        from .imgbrowser import _compare_mask_overlays, _mask_overlay
+
+        physical = self.dataset._sample_index(i)
+        fields = self.dataset._read_standard_fields(physical)
+        width = self._preview_width
+        if self.dataset.transforms:
+            width = max(1, (width - 2) // 2)
+        stored = _mask_overlay(fields[self._imgindex], fields[self._maskindex], width)
+        if not self.dataset.transforms:
+            return stored, fields, physical
+
+        sample = self.dataset._finalize_transform_output(self.dataset._trafo(fields))
+        transformed = _mask_overlay(sample[self._imgindex], sample[self._maskindex], width)
+        return _compare_mask_overlays(stored, transformed), sample, physical
+
+    def __getitem__(self, i:int):
+        image, sample, physical = self._read_preview(i)
         label = None
         if self._labindex is not None:
             label = sample[self._labindex]
             if self.labeldict is not None:
                 label = self.labeldict.get(label, label)
 
-        meta = {'idx': i}
+        meta:dict[str,int|str|None] = {'idx': i}
         if self._stemindex is not None and not self.dataset.transforms:
             meta['stem'] = sample[self._stemindex]
         else:
-            physical = self.dataset._sample_index(i)
+            if physical is None:
+                physical = self.dataset._sample_index(i)
             row = self.dataset.fold.state.arr[physical * self.dataset._nrealext]
             meta['stem'] = self.dataset.retriever.hdrname(row)
         if self._idxindex is not None:
@@ -159,7 +197,7 @@ class _BrowserWrapper:
         if self._fidindex is not None:
             meta['fid'] = int(sample[self._fidindex])
 
-        return sample[self._imgindex], label, meta
+        return image, label, meta
 
     def resolve_stems(self, stems:set[str]) -> dict[str,int]:
         '''Resolve archive stems to positions in the current dataset view.'''
@@ -209,6 +247,7 @@ class iTarDataset(Dataset[Any]):
         enforce_contiguous:bool=False,
         *,
         jpeg_as_tensor:bool=False,
+        mask_as_tensor:bool=False,
         **kwargs
     ):
         kw = {'verbose':True, 'enforce_contiguous':enforce_contiguous}
@@ -234,6 +273,7 @@ class iTarDataset(Dataset[Any]):
 
         # Init valid extensions
         self._jpeg_as_tensor = jpeg_as_tensor
+        self._mask_as_tensor = mask_as_tensor
         self._val_ext = list(self.fold.state.ext2id.keys())
         if extensions is None:
             extensions = self._val_ext
@@ -292,6 +332,9 @@ class iTarDataset(Dataset[Any]):
         return self._sampler[self._local_to_global_index(idx)]
 
     def _getitem_standard(self, idx:int) -> Any:
+        return self._finalize_transform_output(self._trafo(self._read_standard_fields(idx)))
+
+    def _read_standard_fields(self, idx:int) -> list[Any]:
         n = self._nrealext
         idx_start = idx * n
         rows = self.fold.state.arr[idx_start:idx_start+n]
@@ -309,9 +352,7 @@ class iTarDataset(Dataset[Any]):
         if '_fid' in self._pseu_ext:
             out['_fid'] = int(rows[0]['fid'])
 
-        return self._finalize_transform_output(
-            self._trafo([out[e] for e in self.extensions])
-        )
+        return [out[e] for e in self.extensions]
 
     def _getitem_grouped(self, idx:int) -> Any:
         n = self._nrealext
@@ -369,9 +410,12 @@ class iTarDataset(Dataset[Any]):
         if self._nrealext == 0:
             raise ValueError('At least one real extension must be provided!')
         self._extmap = {v: k for k, v in self.fold.state.ext2id.items()}
-        self.decoders = _parse_decoders(
-            self.fold, _JPEG_TENSOR_DECODERS if self._jpeg_as_tensor else None
-        )
+        overrides = {}
+        if self._jpeg_as_tensor:
+            overrides.update(_JPEG_TENSOR_DECODERS)
+        if self._mask_as_tensor:
+            overrides.update(_MASK_TENSOR_DECODERS)
+        self.decoders = _parse_decoders(self.fold, overrides)
         self._logical_field_names = logical_field_names(self.extensions)
         self._logical_name_to_index = {
             name: i for i, name in enumerate(self._logical_field_names)
@@ -1211,6 +1255,7 @@ class iTarDataset(Dataset[Any]):
         backend:Literal['notebook','web']='notebook',
         port:int=0,
         open_browser:bool=False,
+        mask_ext:str|None=None,
     ):
         '''Display a paginated image gallery with selection import and export.
 
@@ -1235,10 +1280,13 @@ class iTarDataset(Dataset[Any]):
             Web port. The default of zero lets the OS choose an available port.
         open_browser : bool, optional
             Open the web gallery in the default browser, by default False.
+        mask_ext : str or None, optional
+            Overlay integer class IDs from this field. When the dataset has
+            transforms, show the stored and transformed overlays side by side.
         '''
         from .imgbrowser import browse_dataset
 
-        view = _BrowserWrapper(self, img_ext, lab_ext, labeldict)
+        view = _BrowserWrapper(self, img_ext, lab_ext, labeldict, mask_ext=mask_ext, width=width)
         return browse_dataset(
             view,
             page_size=page_size,

@@ -17,15 +17,14 @@ def main(argv: Sequence[str] | None = None) -> None:
     parser.add_argument("--fold", default="train", help="Fold to browse (default: train).")
     parser.add_argument("--image-ext", default="jpg", help="Image field (default: jpg).")
     parser.add_argument("--label-ext", help="Label field to display, such as cls.")
+    parser.add_argument("--mask-ext", help="Mask field to overlay, such as seg8.")
     parser.add_argument("--port", type=int, default=0, help="Loopback port (default: automatically assigned).")
     parser.add_argument("--no-open", action="store_true", help="Print the URL without opening a browser.")
     args = parser.parse_args(argv)
     if not 0 <= args.port <= 65535:
         parser.error("--port must be between 0 and 65535.")
 
-    extensions = [args.image_ext]
-    if args.label_ext is not None:
-        extensions.append(args.label_ext)
+    extensions = [ext for ext in (args.image_ext, args.label_ext, args.mask_ext) if ext is not None]
 
     try:
         root = args.dataset.expanduser().resolve()
@@ -39,6 +38,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             backend="web",
             port=args.port,
             open_browser=not (args.no_open or os.environ.get("SSH_CONNECTION")),
+            mask_ext=args.mask_ext,
         )
     except (OSError, ValueError) as exc:
         parser.exit(1, f"{parser.prog}: {exc}\n")

@@ -4,9 +4,11 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
+import numpy as np
 import torch
 from PIL import Image
 from torchvision import tv_tensors
+from torchvision.transforms import v2
 from torchvision.transforms.functional import pil_to_tensor
 
 from glzn.aug import Solarization, build_dino_pipeline
@@ -16,6 +18,46 @@ from glzn.data.writer import iTarDatasetWriter
 
 
 class ITarTests(unittest.TestCase):
+    def test_wide_masks_round_trip_and_share_geometry_with_the_image(self):
+        foreground = np.indices((8, 10)).sum(axis=0) % 2 != 0
+        pixels = np.repeat((foreground * 255).astype(np.uint8)[..., None], 3, axis=2)
+        image = Image.fromarray(pixels)
+        image.format = "JPEG"
+        masks = {
+            "seg8": (foreground * 0xFF).astype(np.uint8),
+            "seg16": (foreground * 0xFFFF).astype(np.uint16),
+            "seg24": (foreground * 0xFFFFFF).astype(np.uint32),
+            "seg32": (foreground * 0xFFFFFFFF).astype(np.uint32),
+        }
+
+        with TemporaryDirectory() as directory:
+            with iTarDatasetWriter("masks", directory, folds=["train"]) as writer:
+                writer.fold("train").write("pattern", {"jpg": image, **masks})
+            extensions = ["jpg", *masks]
+            raw = iTarDataset("masks", directory, "train", extensions, verbose=False)
+            for ext, decoded in zip(masks, raw[0][1:], strict=True):
+                with self.subTest(extension=ext):
+                    self.assertEqual(decoded.dtype, masks[ext].dtype)
+                    np.testing.assert_array_equal(decoded, masks[ext])
+
+            typed = iTarDataset(
+                "masks", directory, "train", extensions,
+                jpeg_as_tensor=True, mask_as_tensor=True, verbose=False,
+            )
+            typed.map_group(
+                v2.Compose([v2.RandomCrop((6, 8)), v2.RandomHorizontalFlip(p=1)]),
+                indices=[0, 1, 2, 3, 4],
+            )
+            transformed_image, *transformed_masks = typed[0]
+            for expected, mask in zip(masks.values(), transformed_masks, strict=True):
+                self.assertIsInstance(mask, tv_tensors.Mask)
+                self.assertEqual(mask.dtype, torch.int64)
+                self.assertEqual(mask.unique().tolist(), [0, int(expected.max())])
+                torch.testing.assert_close(transformed_image[0] > 127, mask != 0)
+
+            by_stem = typed.lookup_stems(["pattern"], extensions=["seg32"])
+            self.assertIsInstance(by_stem["pattern"]["seg32"], tv_tensors.Mask)
+
     def test_repeated_fields_feed_dino_collation(self):
         pipeline = build_dino_pipeline(
             global_size=32, local_size=16, local_crops_number=1

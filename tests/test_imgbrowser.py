@@ -5,7 +5,9 @@ from tempfile import TemporaryDirectory
 from unittest.mock import patch
 from urllib.parse import urlsplit
 
+import numpy as np
 from PIL import Image
+from torchvision.transforms import v2
 
 from glzn.data._imgbrowser_web import _create_server
 from glzn.data.dataset import _BrowserWrapper, iTarDataset
@@ -14,6 +16,35 @@ from glzn.data.writer import iTarDatasetWriter
 
 
 class GalleryTests(unittest.TestCase):
+    def test_mask_overlay_compares_stored_and_transformed_samples(self):
+        with TemporaryDirectory() as directory:
+            image = Image.new("RGB", (6, 4), "white")
+            image.format = "JPEG"
+            mask = np.zeros((4, 6), dtype=np.uint32)
+            mask[:, :2] = 0xFEDCBA98
+            with iTarDatasetWriter("masks", directory, folds=["train"]) as writer:
+                writer.fold("train").write("pair", {"jpg": image, "seg32": mask, "cls": 3})
+            dataset = iTarDataset(
+                "masks", directory, "train",
+                jpeg_as_tensor=True, mask_as_tensor=True, verbose=False,
+            )
+            view = _BrowserWrapper(dataset, mask_ext="seg32", width=14)
+            overlay, _, _ = view[0]
+            self.assertEqual(overlay.size, (6, 4))
+            self.assertEqual(overlay.getpixel((5, 0)), (255, 255, 255))
+            self.assertNotEqual(overlay.getpixel((0, 0)), (255, 255, 255))
+
+            dataset.map_group(v2.RandomHorizontalFlip(p=1), indices=[0, 1])
+            with patch.object(
+                dataset.retriever, "from_row", wraps=dataset.retriever.from_row
+            ) as read:
+                preview, label, meta = view[0]
+                self.assertEqual(read.call_count, 3)
+            self.assertEqual((label, meta["stem"]), (3, "pair"))
+            self.assertEqual(preview.size, (14, 4))
+            np.testing.assert_array_equal(np.asarray(preview)[:, :6], np.asarray(overlay))
+            np.testing.assert_array_equal(np.asarray(preview)[:, 8:], np.asarray(overlay)[:, ::-1])
+
     def test_thumbnail_disconnect_does_not_send_a_second_response(self):
         gallery = _Gallery([Image.new("RGB", (16, 16))], page_size=1, width=16)
         with patch("glzn.data._imgbrowser_web.ThreadingHTTPServer") as server:
@@ -68,7 +99,7 @@ class GalleryTests(unittest.TestCase):
             )
             dataset.set_shuffle().set_distributed(rank=1, world_size=2, drop_last=True)
             view = _BrowserWrapper(dataset)
-            expected = {view[i][2]["stem"]: i for i in range(len(view))}
+            expected = {str(view[i][2]["stem"]): i for i in range(len(view))}
             stems = sorted(expected)
             gallery = _Gallery(view, page_size=8, width=16, stem_lookup=view.resolve_stems)
             with patch.object(

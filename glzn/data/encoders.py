@@ -620,7 +620,7 @@ class SEG16(EncoderDecoder):
     
     def _encode(self, obj:np.ndarray):
         assert obj.dtype == np.uint16
-        img = Image.fromarray(obj, 'I;16')
+        img = Image.fromarray(obj)
         byte_arr = BytesIO()
         img.save(byte_arr, format='PNG')
         return byte_arr.getvalue()
@@ -687,6 +687,7 @@ class SEG24(EncoderDecoder):
         return np.stack((r,g,b), 2)
 
     def _fromrgb(self, arr:np.ndarray) -> np.ndarray:
+        arr = arr.astype(np.uint32)
         r, g, b = arr[:,:,0], arr[:,:,1], arr[:,:,2]
         return r * self._bit16 + g * self._bit8 + b
 
@@ -762,6 +763,7 @@ class SEG32(EncoderDecoder):
         return np.stack((r,g,b,a), 2)
 
     def _fromrgba(self, arr:np.ndarray) -> np.ndarray:
+        arr = arr.astype(np.uint32)
         r, g, b, a = arr[:,:,0], arr[:,:,1], arr[:,:,2], arr[:,:,3]
         return r * self._bit24 + g * self._bit16 + b * self._bit8 + a
 
@@ -777,6 +779,16 @@ class SEG32(EncoderDecoder):
         img = Image.open(byte_arr).convert('RGBA')
         return self._fromrgba(np.array(img))
     
+
+class _MaskTensorDecoder:
+
+    def __init__(self, decoder:EncoderDecoder):
+        self.decoder = decoder
+
+    def __call__(self, data:bytes) -> tv_tensors.Mask:
+        mask = torch.as_tensor(self.decoder(data), dtype=torch.int64)
+        return tv_tensors.Mask(mask)
+
 
 class JSON(EncoderDecoder):
     """JSON encoding / decoding for text, trees, string objects, etc.

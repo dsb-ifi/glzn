@@ -10,6 +10,7 @@ from io import BytesIO
 from threading import Lock
 from typing import Literal, Protocol
 
+import numpy as np
 from PIL import Image
 from torch import Tensor
 from torchvision.transforms.functional import to_pil_image
@@ -33,6 +34,49 @@ def _parse_item(item):
     if isinstance(stem, Mapping):
         stem = stem.get("stem")
     return image, label, str(stem) if stem is not None and str(stem).strip() else None
+
+
+def _mask_overlay(image: object, mask: object, width: int) -> Image.Image:
+    if isinstance(image, Tensor):
+        if image.is_floating_point():
+            image = image.clamp(0, 1)
+        image = to_pil_image(image)
+    if not isinstance(image, Image.Image):
+        raise TypeError("Mask overlays require a PIL image or an image tensor.")
+
+    labels = mask.detach().cpu().numpy() if isinstance(mask, Tensor) else np.asarray(mask)
+    if labels.ndim == 3 and labels.shape[0] == 1:
+        labels = labels[0]
+    if labels.shape != (image.height, image.width):
+        raise ValueError(
+            f"Mask shape {labels.shape} does not match image shape {(image.height, image.width)}."
+        )
+    if not np.issubdtype(labels.dtype, np.integer) and labels.dtype != np.bool_:
+        raise ValueError("Mask overlays require integer class IDs.")
+
+    base = image.convert("RGBA")
+    base.thumbnail((width, width))
+    if base.size != image.size:
+        # Select the closest input pixel to each thumbnail pixel center.
+        y = ((2 * np.arange(base.height) + 1) * image.height) // (2 * base.height)
+        x = ((2 * np.arange(base.width) + 1) * image.width) // (2 * base.width)
+        labels = labels[np.ix_(y, x)]
+
+    # The same ID has the same color in every sample, including wide IDs.
+    colors = labels.astype(np.uint64) * np.uint64(0x9E3779B97F4A7C15)
+    rgba = np.empty((*labels.shape, 4), dtype=np.uint8)
+    for channel, shift in enumerate((0, 16, 32)):
+        rgba[..., channel] = 64 + (colors >> shift) % 192
+    rgba[..., 3] = np.where(labels == 0, 0, 112)
+    return Image.alpha_composite(base, Image.fromarray(rgba)).convert("RGB")
+
+
+def _compare_mask_overlays(stored: Image.Image, transformed: Image.Image) -> Image.Image:
+    x = stored.width + 2
+    view = Image.new("RGB", (x + transformed.width, max(stored.height, transformed.height)), "#333")
+    view.paste(stored, (0, 0))
+    view.paste(transformed, (x, 0))
+    return view
 
 
 @dataclass(frozen=True)
