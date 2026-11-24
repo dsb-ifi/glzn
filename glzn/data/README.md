@@ -41,6 +41,8 @@ The `itar` package provides fast random access into tar shards via an index.
 5. Optionally collapse logical arity for packaging.
 6. Iterate with sampler policy (`sampler.py`) / collate.
 
+Pass `jpeg_as_tensor=True` to `iTarDataset` when your transforms work with tensors. JPEG fields then arrive as RGB `torchvision.tv_tensors.Image` objects with shape `(3, H, W)` and dtype `torch.uint8`. The decoder uses Pillow for payloads that torchvision cannot decode and returns the same tensor representation. By default, image fields use the Pillow decoder.
+
 ## Logical field model
 
 `iTarDataset` is built around a **fixed logical field arity** from the ordered
@@ -277,37 +279,38 @@ The template above is rejected because slot `0` requires `{jpg, npy}` while slot
 
 ## Browsing samples
 
-Use `BrowserWrapper` together with `browse_dataset` when inspecting iTar samples.
-Labels are taken from the same iterable item as the image (no separate labels input).
+Use the same Python interpreter you used to install GLZN with pip. If you installed GLZN in a virtual environment, activate it first.
 
-Example:
-
-```python
-from glzn.data.dataset import iTarDataset, BrowserWrapper
-from glzn.data.imgbrowser import browse_dataset
-
-ds = iTarDataset('my_dataset', '/data', fold='train', extensions=['jpg', 'cls'])
-view = BrowserWrapper(ds, img_ext='jpg', lab_ext='cls')
-browse_dataset(view, page_size=24, cols=6, width=128)
+```sh
+python -m glzn.data._imgbrowser_cli ~/data/IN1k --fold val --label-ext cls
 ```
 
-Notes:
-- `BrowserWrapper` validates `img_ext` against `encoders.PIL` supported extensions.
-- Browser entries should be either `PIL.Image` or tuples where element `0` is image and element `1` is label.
-- Selection workflow in browser:
-  - Use `Select` toggles on cards to mark examples.
-  - `Only Selected` limits the gallery view to selected items.
-  - `Export Selection` creates a downloadable JSON list of selected stems.
-  - `Import Selection` loads selections from a JSON list upload.
+The gallery reads existing indexes and uses the `jpg` field by default. Use `--label-ext` to add labels. Locally the gallery opens in your default browser. Pass `--no-open` to print the URL and open it yourself, and press Ctrl+C in the terminal to stop the gallery.
 
-Selection JSON format:
+Call the web backend directly if you already have a dataset object in Python.
+
+```python
+from glzn.data.dataset import iTarDataset
+
+ds = iTarDataset('my_dataset', '/data', fold='train', extensions=['jpg', 'cls'])
+ds.browse(backend='web', port=8765)
+```
+
+If the gallery runs on a remote host, start it there with `--port 8765` and forward that port. Open the full printed URL in your local browser, including its path.
+
+```sh
+ssh -N -L 8765:127.0.0.1:8765 user@remote-host
+```
+
+For an inline notebook view, install the `notebook` extra with `pip install '.[notebook]'` from the checkout, then call `ds.browse()`. Both views load thumbnails page by page and let you mark samples, show only selected items, and export or import a JSON list of stems.
 
 ```json
 ["sample0001", "sample0002", "sample0100"]
 ```
 
-Imported entries with missing stems in the current view are ignored.
-Legacy verbose object formats are not accepted by import.
+Selections are stored by archive stem, so you can import them after changing the sample order. Imports report stems missing from the current view.
+
+For other indexable collections, call `glzn.data.imgbrowser.browse_dataset(items, backend='web')`. Items can be PIL images, image tensors, or tuples of `(image, label, stem)` with the label and stem optional. A metadata dictionary with a `stem` entry also works in the third position. Export skips items without a stem.
 
 ## Lookup by stems
 

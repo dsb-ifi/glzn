@@ -7,7 +7,7 @@ import string
 from contextlib import contextmanager
 from os import PathLike
 from pathlib import Path
-from typing import Any, Callable, Mapping, Sequence
+from typing import Any, Callable, Literal, Mapping, Sequence
 
 import numpy as np
 import torchvision
@@ -15,8 +15,7 @@ import xxhash
 from packaging.version import parse as parse_version
 from torch.utils.data import Dataset
 
-from .encoders import DEFAULT_DECODERS, PIL, PseudoExtension
-from .imgbrowser import browse_dataset
+from .encoders import DEFAULT_DECODERS, PIL, PseudoExtension, decode_jpeg_tensor
 from .itar.fold import iTarFold, iTarRetriever
 from .itar.utils import StemHelper, stripext
 from .maptrafo import (
@@ -34,6 +33,10 @@ USE_TV_TENSOR = parse_version(torchvision.__version__) >= parse_version('0.16')
 _valid_pseudo_extensions = PseudoExtension._valid_pseudo_extensions
 Transform = Callable[..., Any]
 Decoder = Callable[[bytes], Any]
+_JPEG_TENSOR_DECODERS: dict[str, Decoder] = dict.fromkeys(
+    ('jfif', 'jpe', 'jpeg', 'jpg'), decode_jpeg_tensor
+)
+_VALIDATION_CHUNK_SIZE = 1 << 16
 
 
 # TODO: Possibly Pseudoepoch: A selected artificial number of samples that can be anything, 
@@ -145,14 +148,48 @@ class _BrowserWrapper:
                 label = self.labeldict.get(label, label)
 
         meta = {'idx': i}
-        if self._stemindex is not None:
+        if self._stemindex is not None and not self.dataset.transforms:
             meta['stem'] = sample[self._stemindex]
+        else:
+            physical = self.dataset._sample_index(i)
+            row = self.dataset.fold.state.arr[physical * self.dataset._nrealext]
+            meta['stem'] = self.dataset.retriever.hdrname(row)
         if self._idxindex is not None:
             meta['idx'] = int(sample[self._idxindex])
         if self._fidindex is not None:
             meta['fid'] = int(sample[self._fidindex])
 
         return sample[self._imgindex], label, meta
+
+    def resolve_stems(self, stems:set[str]) -> dict[str,int]:
+        '''Resolve archive stems to positions in the current dataset view.'''
+        dataset = self.dataset
+        size = len(dataset)
+        rows = dataset.fold.state.arr[::dataset._nrealext]
+        hashes = np.fromiter(
+            (xxhash.xxh64(stem.encode()).intdigest() for stem in stems), dtype=np.uint64
+        )
+        candidates = np.flatnonzero(np.isin(rows['keyhash'], hashes))
+        if not candidates.size:
+            return {}
+
+        rank, world_size = dataset._distributed_rank, dataset._distributed_world_size
+        if isinstance(dataset._sampler, IdentitySampler):
+            offsets = candidates - rank
+            local = offsets // world_size
+            visible = (offsets >= 0) & (offsets % world_size == 0) & (local < size)
+            local, physical = local[visible], candidates[visible]
+        else:
+            order = dataset._sampler.randperm()[rank:rank + size * world_size:world_size]
+            local = np.flatnonzero(np.isin(order, candidates))
+            physical = order[local]
+
+        resolved:dict[str,int] = {}
+        for local_idx, physical_idx in zip(local, physical):
+            stem = dataset.retriever.hdrname(rows[physical_idx])
+            if stem in stems:
+                resolved.setdefault(stem, int(local_idx))
+        return resolved
 
 
 class iTarDataset(Dataset[Any]):
@@ -170,6 +207,8 @@ class iTarDataset(Dataset[Any]):
         internal_seed:int=0,
         buckets_per_shard:int=2,
         enforce_contiguous:bool=False,
+        *,
+        jpeg_as_tensor:bool=False,
         **kwargs
     ):
         kw = {'verbose':True, 'enforce_contiguous':enforce_contiguous}
@@ -194,6 +233,7 @@ class iTarDataset(Dataset[Any]):
         )
 
         # Init valid extensions
+        self._jpeg_as_tensor = jpeg_as_tensor
         self._val_ext = list(self.fold.state.ext2id.keys())
         if extensions is None:
             extensions = self._val_ext
@@ -235,41 +275,39 @@ class iTarDataset(Dataset[Any]):
         return self._distributed_len(self._global_len())
 
     def __getitem__(self, idx:int) -> Any:
-        self._sync_epoch_from_shared()
-        if idx < 0:
-            idx = len(self) + idx
-        if idx < 0 or idx >= len(self):
-            raise IndexError(
-                f'iTarDataset index out of range, {idx} not in [0, {len(self)}).'
-            )
-        idx = self._sampler[self._local_to_global_index(idx)]
-
+        idx = self._sample_index(idx)
         if self._grouping_active:
             return self._getitem_grouped(idx)
         return self._getitem_standard(idx)
 
+    def _sample_index(self, idx:int) -> int:
+        self._sync_epoch_from_shared()
+        size = self._distributed_len(self._global_len())
+        if idx < 0:
+            idx += size
+        if idx < 0 or idx >= size:
+            raise IndexError(
+                f'iTarDataset index out of range, {idx} not in [0, {size}).'
+            )
+        return self._sampler[self._local_to_global_index(idx)]
+
     def _getitem_standard(self, idx:int) -> Any:
         n = self._nrealext
         idx_start = idx * n
+        rows = self.fold.state.arr[idx_start:idx_start+n]
         out = {}
-        fid = None
-        stem = None
 
-        for row in self.fold.state.arr[idx_start:idx_start+n]:
+        for row in rows:
             extid = row['extid']
             ext = self._extmap[extid]
-            fid = row['fid'] if fid is None else fid
-            stem = self.retriever.hdrname(row) if stem is None else stem
             out[ext] = self.decoders[extid](bytes(self.retriever.from_row(row)))
 
-        for ext in self._pseu_ext:
-            match ext:
-                case '_name' | '_stem':
-                    out[ext] = stem
-                case '_idx':
-                    out[ext] = idx
-                case '_fid':
-                    out[ext] = int(fid) if fid is not None else None
+        if '_stem' in self._pseu_ext or '_name' in self._pseu_ext:
+            out['_name'] = out['_stem'] = self.retriever.hdrname(rows[0])
+        if '_idx' in self._pseu_ext:
+            out['_idx'] = idx
+        if '_fid' in self._pseu_ext:
+            out['_fid'] = int(rows[0]['fid'])
 
         return self._finalize_transform_output(
             self._trafo([out[e] for e in self.extensions])
@@ -331,7 +369,9 @@ class iTarDataset(Dataset[Any]):
         if self._nrealext == 0:
             raise ValueError('At least one real extension must be provided!')
         self._extmap = {v: k for k, v in self.fold.state.ext2id.items()}
-        self.decoders = _parse_decoders(self.fold)
+        self.decoders = _parse_decoders(
+            self.fold, _JPEG_TENSOR_DECODERS if self._jpeg_as_tensor else None
+        )
         self._logical_field_names = logical_field_names(self.extensions)
         self._logical_name_to_index = {
             name: i for i, name in enumerate(self._logical_field_names)
@@ -535,27 +575,37 @@ class iTarDataset(Dataset[Any]):
                 f'{caller}: expected {n} unique real extensions, got '
                 f'{len(expected_ids)} from {sorted(self._real_ext)}.'
             )
-        expected_ext = sorted(self._real_ext)
-        for start in range(0, len(arr), n):
-            rows = arr[start:start+n]
-            keys = {(int(r['keyhash']), int(r['crashid'])) for r in rows}
-            if len(keys) != 1:
+        expected = np.array(sorted(expected_ids))
+        groups = arr.reshape(-1, n)
+        for group_start in range(0, len(groups), _VALIDATION_CHUNK_SIZE):
+            chunk = groups[group_start:group_start + _VALIDATION_CHUNK_SIZE]
+            same_stem = (
+                (chunk['keyhash'] == chunk['keyhash'][:, :1])
+                & (chunk['crashid'] == chunk['crashid'][:, :1])
+            ).all(axis=1)
+            valid_extensions = (np.sort(chunk['extid'], axis=1) == expected).all(axis=1)
+            invalid = np.flatnonzero(~(same_stem & valid_extensions))
+            if not invalid.size:
+                continue
+
+            first = int(invalid[0])
+            start = (group_start + first) * n
+            rows = chunk[first]
+            if not same_stem[first]:
                 stems = [self._stem_label(r) for r in rows]
                 raise ValueError(
                     f'{caller}: row group starting at row {start} mixes stems '
                     f'{stems}; expected one contiguous stem block.'
                 )
-            observed_ids = [int(r['extid']) for r in rows]
-            if set(observed_ids) != expected_ids or len(observed_ids) != len(set(observed_ids)):
-                observed = [
-                    self._extmap.get(int(extid), f'<unknown:{int(extid)}>')
-                    for extid in observed_ids
-                ]
-                raise ValueError(
-                    f'{caller}: row group starting at row {start} for stem '
-                    f'{self._stem_label(rows[0])} has extensions {observed}; '
-                    f'expected exactly once each: {expected_ext}.'
-                )
+            observed = [
+                self._extmap.get(int(extid), f'<unknown:{int(extid)}>')
+                for extid in rows['extid']
+            ]
+            raise ValueError(
+                f'{caller}: row group starting at row {start} for stem '
+                f'{self._stem_label(rows[0])} has extensions {observed}; '
+                f'expected exactly once each: {sorted(self._real_ext)}.'
+            )
 
     def _infer_grouping(self, seq_str:tuple[str,...]|None) -> int:
         if seq_str is None:
@@ -901,7 +951,6 @@ class iTarDataset(Dataset[Any]):
         rows = arr[hits]
 
         out:dict[str, dict[str, Any]] = {s: {} for s in stem_list}
-        decoders = _parse_decoders(self.fold)
         id2ext = {v:k for k,v in ext2id.items()}
 
         for row in rows:
@@ -910,7 +959,7 @@ class iTarDataset(Dataset[Any]):
                 continue
 
             ext = id2ext[int(row['extid'])]
-            out[stem_on_disk][ext] = decoders[int(row['extid'])](
+            out[stem_on_disk][ext] = self.decoders[int(row['extid'])](
                 bytes(self.retriever.from_row(row))
             )
 
@@ -1156,16 +1205,14 @@ class iTarDataset(Dataset[Any]):
         return self
     
     def browse(
-        self, img_ext:str='jpg', lab_ext:str='cls', 
-        labeldict:Mapping[Any,Any]|None=None, page_size:int=24, 
-        cols:int=6, width:int=128
+        self, img_ext:str='jpg', lab_ext:str='cls',
+        labeldict:Mapping[Any,Any]|None=None, page_size:int=24,
+        cols:int=6, width:int=128, *,
+        backend:Literal['notebook','web']='notebook',
+        port:int=0,
+        open_browser:bool=False,
     ):
-        '''Renders a notebook-based browser for the dataset.
-
-        The browser is a convenient way to visually inspect the dataset and its samples. 
-        It displays the images along with their corresponding labels (if available) 
-        in a grid format, with support for pagination and selecting specific samples 
-        for export.
+        '''Display a paginated image gallery with selection import and export.
 
         Parameters
         ----------
@@ -1173,15 +1220,34 @@ class iTarDataset(Dataset[Any]):
             Extension to use for images, by default 'jpg'.
         lab_ext : str, optional
             Extension to use for labels, by default 'cls'.
-        labeldict : Mapping[Any, Any], optional
-            Optional mapping to convert label values, by default None.
-
+        labeldict : Mapping[Any, Any] or None, optional
+            Mapping from stored labels to display labels.
+        page_size : int, optional
+            Number of samples per page, by default 24.
+        cols : int, optional
+            Number of columns in the grid, by default 6.
+        width : int, optional
+            Maximum width and height of each thumbnail in pixels, by default 128.
+        backend : {'notebook', 'web'}, optional
+            Display widgets inline by default. The web backend serves a gallery
+            on loopback until interrupted.
+        port : int, optional
+            Web port. The default of zero lets the OS choose an available port.
+        open_browser : bool, optional
+            Open the web gallery in the default browser, by default False.
         '''
+        from .imgbrowser import browse_dataset
+
+        view = _BrowserWrapper(self, img_ext, lab_ext, labeldict)
         return browse_dataset(
-            _BrowserWrapper(self, img_ext, lab_ext, labeldict),
+            view,
             page_size=page_size,
             cols=cols,
             width=width,
+            backend=backend,
+            port=port,
+            open_browser=open_browser,
+            stem_lookup=view.resolve_stems,
         )
     
     @contextmanager

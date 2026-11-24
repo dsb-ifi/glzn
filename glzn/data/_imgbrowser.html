@@ -1,0 +1,197 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GLZN · Dataset browser</title>
+<style>
+  :root { color-scheme: light dark; font-family: system-ui, sans-serif; }
+  body { margin: 0; background: light-dark(#f1f3f1, #151918); color: light-dark(#152521, #e6eeeb); }
+  main { max-width: 90rem; margin: auto; padding: 2rem clamp(1rem, 4vw, 3rem); }
+  h1 { margin: 0 0 1rem; font-size: clamp(1.5rem, 3vw, 2rem); letter-spacing: -.035em; }
+  .controls { display: flex; flex-wrap: wrap; align-items: center; gap: .55rem; margin: .75rem 0; }
+  .status { min-height: 1.5em; font-size: .9rem; }
+  .counter { color: light-dark(#485f57, #a8bdb4); font-size: .9rem; }
+  button, input { font: inherit; }
+  button, input[type=number] { border: 1px solid light-dark(#bac9c0, #4f645a); border-radius: .45rem; padding: .4rem .65rem; }
+  button { background: light-dark(#fff, #272f2b); color: inherit; cursor: pointer; }
+  button:hover:not(:disabled) { border-color: #398364; }
+  button:disabled { cursor: default; opacity: .45; }
+  :focus-visible { outline: 2px solid #388464; outline-offset: 3px; }
+  #page-number { width: 5em; }
+  #grid {
+    display: grid; gap: .8rem;
+    max-width: calc(var(--cols, 6) * (var(--thumbnail, 128px) + 42px));
+    grid-template-columns: repeat(auto-fill, minmax(min(100%, calc(var(--thumbnail, 128px) + 25px)), 1fr));
+  }
+  .sample { display: grid; gap: .4rem; align-content: start; text-align: left; padding: .65rem; min-width: 0; }
+  .sample[aria-pressed=true] { border-color: #378768; box-shadow: inset 0 0 0 1px #378768; background: light-dark(#e0f1e7, #203b30); }
+  .sample img { display: block; width: 100%; height: var(--thumbnail, 128px); object-fit: contain; background: light-dark(#edf0ed, #181e1a); border-radius: .2rem; }
+  .sample span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: .82rem; }
+  .sample span + span { color: light-dark(#485f57, #a8bdb4); font-variant-numeric: tabular-nums; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Dataset browser</h1>
+  <form id="navigation" class="controls" aria-label="Page navigation">
+    <button id="previous" type="button" aria-label="Previous page">←</button>
+    <label for="page-number">Page</label>
+    <input id="page-number" type="number" min="1" value="1" required>
+    <button type="submit">Go</button>
+    <button id="next" type="button" aria-label="Next page">→</button>
+    <span id="counter" class="counter"></span>
+  </form>
+  <div class="controls" aria-label="Selection tools">
+    <label><input id="selected-only" type="checkbox"> Only selected</label>
+    <span id="selected-count" class="counter"></span>
+    <button id="export" type="button">Export selection</button>
+    <button id="import" type="button">Import selection</button>
+    <button id="clear" type="button">Clear</button>
+    <input id="selection-file" type="file" accept=".json,application/json" hidden>
+  </div>
+  <div id="status" class="status" role="status"></div>
+  <div id="grid"></div>
+</main>
+<script type="module">
+"use strict";
+
+const navigation = document.querySelector("#navigation");
+const pageNumber = document.querySelector("#page-number");
+const previous = document.querySelector("#previous");
+const next = document.querySelector("#next");
+const selectedOnly = document.querySelector("#selected-only");
+const status = document.querySelector("#status");
+const grid = document.querySelector("#grid");
+const selectionFile = document.querySelector("#selection-file");
+const pages = [1, 1];
+let current = 1;
+let last = 1;
+let busy = false;
+
+async function request(path, options) {
+  const response = await fetch(path, options);
+  if (!response.ok) {
+    const error = await response.json().catch(() => ({}));
+    throw new Error(error.error || "Gallery request failed.");
+  }
+  return response;
+}
+
+async function post(path, data) {
+  const response = await request(path, {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify(data)
+  });
+  return response.json();
+}
+
+async function run(action) {
+  if (busy) return;
+  busy = true;
+  selectedOnly.disabled = true;
+  grid.setAttribute("aria-busy", "true");
+  status.textContent = "";
+  try {
+    await action();
+  } catch (error) {
+    status.textContent = error.message;
+  } finally {
+    selectedOnly.disabled = false;
+    grid.setAttribute("aria-busy", "false");
+    busy = false;
+  }
+}
+
+function card(item) {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "sample";
+  button.setAttribute("aria-pressed", item.selected);
+  const image = document.createElement("img");
+  image.src = "thumbnail/" + item.index;
+  image.alt = "";
+  image.loading = "lazy";
+  button.append(image);
+  for (const caption of [item.label, item.stem || "Sample " + item.index]) {
+    if (caption === null) continue;
+    const line = document.createElement("span");
+    line.textContent = caption;
+    line.title = caption;
+    button.append(line);
+  }
+  button.addEventListener("click", () => run(async () => {
+    const selected = button.getAttribute("aria-pressed") !== "true";
+    const result = await post("api/select", {index: item.index, selected});
+    if (selectedOnly.checked && !selected) {
+      await load(current);
+    } else {
+      button.setAttribute("aria-pressed", selected);
+      document.querySelector("#selected-count").textContent = result.count + " selected";
+    }
+  }));
+  return button;
+}
+
+async function load(number) {
+  const mode = Number(selectedOnly.checked);
+  const response = await request("api/page?" + new URLSearchParams({page: number, selected: mode}));
+  const page = await response.json();
+  current = pages[mode] = page.page;
+  last = page.pages;
+  previous.disabled = current <= 1;
+  next.disabled = current >= last;
+  pageNumber.max = last;
+  pageNumber.value = current;
+  const first = page.items.length ? page.start + 1 : 0;
+  document.querySelector("#counter").textContent =
+    first + "–" + (page.start + page.items.length) + " of " + page.total;
+  document.querySelector("#selected-count").textContent = page.selectionCount + " selected";
+  grid.style.setProperty("--cols", page.cols);
+  grid.style.setProperty("--thumbnail", page.width + "px");
+  grid.replaceChildren(...page.items.map(card));
+  if (!page.items.length) grid.textContent = "No items to display.";
+}
+
+navigation.addEventListener("submit", event => {
+  event.preventDefault();
+  run(() => load(Number(pageNumber.value)));
+});
+previous.addEventListener("click", () => run(() => load(current - 1)));
+next.addEventListener("click", () => run(() => load(current + 1)));
+selectedOnly.addEventListener("change", () => run(() => load(pages[Number(selectedOnly.checked)])));
+
+document.querySelector("#export").addEventListener("click", () => run(async () => {
+  const response = await request("api/export");
+  const url = URL.createObjectURL(await response.blob());
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = "selection.json";
+  link.click();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+  const skipped = Number(response.headers.get("X-Skipped-Selections") || "0");
+  if (skipped) status.textContent = "Skipped " + skipped + " selected items without stems.";
+}));
+document.querySelector("#import").addEventListener("click", () => selectionFile.click());
+selectionFile.addEventListener("change", () => run(async () => {
+  const file = selectionFile.files[0];
+  if (!file) return;
+  selectionFile.value = "";
+  const response = await request("api/import", {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: file
+  });
+  const result = await response.json();
+  await load(current);
+  status.textContent = "Imported " + result.imported + ", skipped " + result.skipped + ".";
+}));
+document.querySelector("#clear").addEventListener("click", () => run(async () => {
+  await post("api/clear", {});
+  await load(current);
+}));
+run(() => load(1));
+</script>
+</body>
+</html>

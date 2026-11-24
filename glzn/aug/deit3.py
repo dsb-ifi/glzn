@@ -7,6 +7,7 @@ from torch import Tensor
 from torch.utils.data import default_collate
 from torchvision.transforms import v2
 from torchvision.transforms.functional import InterpolationMode
+from torchvision.transforms.v2.functional import solarize
 
 SampleTransform = Callable[[object], object]
 CollateTransform = Callable[[Sequence[object]], object]
@@ -22,12 +23,14 @@ class AugmentationPipeline:
 
 
 class Solarization:
-    """Solarize a PIL image using the DeiT 3-Augment default threshold."""
+    """Solarize a PIL image or an 8-bit tensor using the DeiT 3-Augment threshold."""
 
     def __init__(self, threshold: int = 128):
         self.threshold = threshold
 
     def __call__(self, img):
+        if isinstance(img, Tensor):
+            return solarize(img, threshold=self.threshold)
         return ImageOps.solarize(img, threshold=self.threshold)
 
 

@@ -34,9 +34,9 @@ Planned submodules:
 
 ## Installation
 
-`pip install git+https://github.com/dsbifi/glzn.git`
+`pip install git+https://github.com/dsb-ifi/glzn.git`
 
-`pip install git+ssh://git@github.com/dsbifi/glzn.git`
+`pip install git+ssh://git@github.com/dsb-ifi/glzn.git`
 
 ---
 

@@ -2,17 +2,18 @@ import os, time, xxhash, mmap
 from functools import lru_cache
 import numpy as np
 
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
 from os import PathLike
-from pathlib import Path, PurePath
-from typing import Sequence
+from pathlib import Path
+from threading import Lock
+from typing import BinaryIO, Sequence
 
 from .entry import parse_tar, iTarState, _BLK
 from .utils import StemHelper
 
 
 @lru_cache(maxsize=128)
-def _mmap_helper(path:str) -> mmap.mmap:
+def _mmap_helper(path:PathLike[str]|str) -> mmap.mmap:
     with open(path,'rb') as file:
         return mmap.mmap(file.fileno(), 0, access=mmap.ACCESS_READ)
     
@@ -270,6 +271,17 @@ class iTarFold:
         return self
     
 
+class _ShardHandles:
+    def __init__(self):
+        self.files: OrderedDict[int, BinaryIO] = OrderedDict()
+        self.pid = os.getpid()
+        self.lock = Lock()
+
+    def __del__(self):
+        for file in self.files.values():
+            file.close()
+
+
 class iTarRetriever:
     """Simple retrieval with iTar.
     
@@ -278,25 +290,48 @@ class iTarRetriever:
     paths : Sequence[str | Path]
         The shard paths in fid order (0 .. len(paths)-1).
     prefer_mmap : bool, default True
-        Toggle mmap. When False we always pread.
+        Try mmap first. Reads that use pread reuse shard handles within the process.
     """
+
+    _MAX_OPEN_SHARDS = 32
 
     def __init__(self, paths: Sequence[Path], prefer_mmap: bool = True):
         if not all(p.exists() for p in paths):
             raise ValueError
         self._paths = paths
         self._prefer_mmap = prefer_mmap
+        self._handles: _ShardHandles | None = None
+
+    def __getstate__(self):
+        return {**vars(self), '_handles': None}
+
+    def _pread(self, fid: int, offset: int, size: int) -> bytes:
+        handles = self._handles
+        if handles is None or handles.pid != os.getpid():
+            # A forked worker must acquire its own lock and open its own files.
+            self._handles = handles = _ShardHandles()
+        files = handles.files
+        with handles.lock:
+            file = files.get(fid)
+            if file is None:
+                if len(files) >= self._MAX_OPEN_SHARDS:
+                    _, oldest = files.popitem(last=False)
+                    oldest.close()
+                file = self._paths[fid].open('rb', buffering=0)
+                files[fid] = file
+            else:
+                files.move_to_end(fid)
+            return os.pread(file.fileno(), size, offset)
 
     def get(self, fid: int, offset: int, size: int) -> memoryview:
-        path = Path(self._paths[fid])
         if self._prefer_mmap:
             try:
-                mm = _mmap_helper(path)
+                mm = _mmap_helper(self._paths[fid])
                 return memoryview(mm)[offset:offset+size]
             except (OSError, ValueError):
                 pass
 
-        return memoryview(_pread_helper(path, offset, size))
+        return memoryview(self._pread(fid, offset, size))
 
     def from_row(self, row) -> memoryview:
         return self.get(int(row["fid"]), int(row["offset"]) + _BLK, int(row["size"]))

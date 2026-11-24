@@ -3,10 +3,14 @@ import numpy as np
 import json
 import scipy.io as spio
 import pickle
+import torch
 
 from io import BytesIO
 from typing import List, Dict, Union, Set, Optional
 from PIL import Image
+from torchvision import tv_tensors
+from torchvision.io import ImageReadMode, decode_jpeg
+from torchvision.transforms.functional import pil_to_tensor
 
 from .itar.fold import iTarFold
 from .itar.utils import stripext
@@ -213,6 +217,18 @@ class PIL(EncoderDecoder):
         byte_arr = BytesIO()
         obj.save(byte_arr, format=obj.format)
         return byte_arr.getvalue()
+
+
+def decode_jpeg_tensor(data:bytes) -> tv_tensors.Image:
+    '''Decode a JPEG field to an RGB uint8 tensor of shape (3, H, W) on CPU.'''
+    encoded = torch.frombuffer(bytearray(data), dtype=torch.uint8)
+    try:
+        image = decode_jpeg(encoded, mode=ImageReadMode.RGB)
+    except RuntimeError:
+        # Some JPEG-labelled members contain another image format or use CMYK.
+        with Image.open(BytesIO(data)) as source:
+            image = pil_to_tensor(source.convert('RGB'))
+    return tv_tensors.Image(image)
 
 
 class CLS(EncoderDecoder):

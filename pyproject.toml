@@ -5,8 +5,6 @@ description = "Small training, configuration, logging, and iTar data utilities."
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
-    "ipython",
-    "ipywidgets",
     "numpy",
     "numpydoc",
     "packaging",
@@ -21,6 +19,9 @@ dependencies = [
     "xxhash",
 ]
 
+[project.optional-dependencies]
+notebook = ["ipython", "ipywidgets"]
+
 [dependency-groups]
 dev = [
     "pyright",
@@ -29,6 +30,9 @@ dev = [
 [tool.setuptools.packages.find]
 include = ["glzn*"]
 exclude = ["rsc*", "tests*"]
+
+[tool.setuptools.package-data]
+"glzn.data" = ["_imgbrowser.html"]
 
 [tool.pyright]
 include = ["glzn", "tests"]
