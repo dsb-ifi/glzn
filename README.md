@@ -17,7 +17,7 @@ The name `glzn` is a textese disemvowelment of *glissen*, meaning sparse in Norw
 `glzn` is packaged in submodules, each designed to facilitate a specific role in running machine learning experiments with PyTorch.
 
 - `glzn.data`: [WDS](https://github.com/webdataset/webdataset) format data wrapper for handling data of different modalities.
-- `glzn.log`: local logging functionality, can be paired with [Aim](https://github.com/aimhubio/aim) for more extensive reporting.
+- `glzn.log`: local JSONL logging and [terminal run summaries](glzn/log/README.md#inspecting-existing-runs).
 - `glzn.cfg`: config and argparse module to handle experiments with [pydantic](https://docs.pydantic.dev/latest/).
 - `glzn.proc`: training and validation processor for runs, providing optimization in a neatly packaged context manager.
 
@@ -80,7 +80,7 @@ Planned submodules:
 - [X] `log` module for rudimentary logging to jsonl and stdout.
     - [X] Basic logging support.
     - [ ] Add-ons (medium priority):
-        - [ ] Add Aim support.
+        - [ ] Follow ongoing runs in a browser.
         - [ ] W&B support.
 - [ ] `optim` module with commonly used optimizers not covered by PyTorch.
     - [ ] cAdamW, StableAdamW, cStableAdamW.

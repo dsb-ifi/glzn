@@ -9,8 +9,8 @@ Pydantic is an implementation and validation mechanism. The serialized JSON
 schema is the public contract. Future internal model refactors must preserve
 schema-v1 JSON compatibility.
 
-JSONL is the canonical durable interchange format. WandB, Aim, and other
-integrations are out of scope here; they should consume the same records later.
+JSONL is the canonical durable interchange format. Other tools can consume
+the same records.
 
 ---
 
@@ -274,6 +274,6 @@ A partial last line stays out of the summary until its newline arrives. The age 
 
 ## Non-goals (this package)
 
-WandB/Aim, upload/replay CLI, schema migrations, DuckDB, async writers,
+W&B, upload/replay CLI, schema migrations, DuckDB, async writers,
 background samplers, artifacts/images/histograms, reducer registries,
 logging-only distributed collectives, automatic task metric computation.
